@@ -16,13 +16,6 @@ extern "C" {
 
 #include "type_utils.h"
 
-/* Windows always runs on LE architectures. */
-#if defined(_MSC_VER)
-#define __ORDER_BIG_ENDIAN__    (0)
-#define __ORDER_LITTLE_ENDIAN__ (1)
-#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__
-#endif
-
 #if !defined(__BYTE_ORDER__)
 #error "Byte-order is not defined!"
 #endif

@@ -247,12 +247,6 @@ typedef enum {
 
 #pragma pack(push, 1) /* START OF FW-CONTROL PROTOCOL STRUCTURES */
 
-#if defined(_MSC_VER)
-// TODO: warning C4200
-#pragma warning(push)
-#pragma warning(disable: 4200)
-#endif
-
 typedef struct {
     uint32_t protocol_version;
     firmware_version_t fw_version;
@@ -1153,11 +1147,6 @@ typedef struct {
     CONTROL_PROTOCOL__status_t status;
     CONTROL_PROTOCOL__response_parameters_t parameters;
 } CONTROL_PROTOCOL__response_t;
-
-
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 
 #pragma pack(pop) /* END OF FW-CONTROL PROTOCOL STRUCTURES */
 

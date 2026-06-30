@@ -105,15 +105,6 @@ struct hailo_pcie_loading_stage {
     u8 amount_of_files_in_stage;
 };
 
-// TODO: HRT-6144 - Align Windows/Linux to QNX
-#ifdef __QNX__
-enum hailo_bar_index {
-    BAR0 = 0,
-    BAR2,
-    BAR4,
-    MAX_BAR
-};
-#else
 enum hailo_bar_index {
     BAR0 = 0,
     BAR1,
@@ -123,7 +114,6 @@ enum hailo_bar_index {
     BAR5,
     MAX_BAR
 };
-#endif // ifdef (__QNX__)
 
 #ifdef __cplusplus
 extern "C" {
