@@ -16,6 +16,11 @@
 #include <linux/uaccess.h>
 
 #define HAILO_VDMA_CHANNEL_TRANSFER_CAPACITY (HAILO_VDMA_MAX_ONGOING_TRANSFERS - 1)
+#define HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_ERROR BIT(0)
+#define HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_INACTIVE BIT(1)
+#define HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP BIT(2)
+#define HAILO_VDMA_VCTX_WAIT_INDEX(engine_index, channel_index) \
+    (((engine_index) * MAX_VDMA_CHANNELS_PER_ENGINE) + (channel_index))
 
 static bool vctx_trace_enabled;
 module_param_named(vctx_trace, vctx_trace_enabled, bool, 0644);
@@ -616,8 +621,8 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
     struct semaphore *board_mutex, bool *should_up_board_mutex)
 {
     struct hailo_vdma_interrupts_wait_params params = {0};
-    struct hailo_vdma_vctx_event snapshots[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE] = {{0}};
-    u32 completed_to_consume[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE] = {{0}};
+    u8 event_flags[MAX_VDMA_ENGINES * MAX_VDMA_CHANNELS_PER_ENGINE] = {0};
+    u8 completed_to_consume[MAX_VDMA_ENGINES * MAX_VDMA_CHANNELS_PER_ENGINE] = {0};
     u8 engine_index;
     u8 channel_index;
     bool bitmap_not_empty = false;
@@ -686,18 +691,23 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
             struct hailo_vdma_vctx_event snapshot;
             unsigned long flags;
+            u32 wait_index;
             u32 completed;
 
             if (!(params.channels_bitmap_per_engine[engine_index] & BIT(channel_index))) {
                 continue;
             }
+            wait_index = HAILO_VDMA_VCTX_WAIT_INDEX(engine_index, channel_index);
             spin_lock_irqsave(&context->vctx.lock, flags);
             snapshot = context->vctx.events[engine_index][channel_index];
-            snapshots[engine_index][channel_index] = snapshot;
             context->vctx.events[engine_index][channel_index].channel_error = false;
             context->vctx.events[engine_index][channel_index].channel_inactive = false;
             context->vctx.events[engine_index][channel_index].disable_wakeup = false;
             spin_unlock_irqrestore(&context->vctx.lock, flags);
+            event_flags[wait_index] =
+                (snapshot.channel_error ? HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_ERROR : 0) |
+                (snapshot.channel_inactive ? HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_INACTIVE : 0) |
+                (snapshot.disable_wakeup ? HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP : 0);
 
             if (snapshot.channel_error || snapshot.channel_inactive) {
                 if (params.channels_count >= ARRAY_SIZE(params.irq_data)) {
@@ -725,7 +735,7 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
             params.irq_data[params.channels_count].channel_index = channel_index;
             params.irq_data[params.channels_count].data = (u8)completed;
             params.channels_count++;
-            completed_to_consume[engine_index][channel_index] = completed;
+            completed_to_consume[wait_index] = (u8)completed;
         }
     }
 
@@ -736,20 +746,22 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
 
     for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
-            const struct hailo_vdma_vctx_event *snapshot =
-                &snapshots[engine_index][channel_index];
-            u32 completed = completed_to_consume[engine_index][channel_index];
+            u32 wait_index = HAILO_VDMA_VCTX_WAIT_INDEX(engine_index, channel_index);
+            u8 snapshot_flags = event_flags[wait_index];
+            u8 completed = completed_to_consume[wait_index];
             u8 data;
 
             if (!(params.channels_bitmap_per_engine[engine_index] & BIT(channel_index))) {
                 continue;
             }
-            if (snapshot->channel_error || snapshot->channel_inactive) {
-                data = snapshot->channel_error ? HAILO_VDMA_TRANSFER_DATA_CHANNEL_WITH_ERROR :
+            if (snapshot_flags & (HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_ERROR |
+                HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_INACTIVE)) {
+                data = (snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_ERROR) ?
+                    HAILO_VDMA_TRANSFER_DATA_CHANNEL_WITH_ERROR :
                     HAILO_VDMA_TRANSFER_DATA_CHANNEL_NOT_ACTIVE;
             } else if (completed) {
                 data = (u8)completed;
-            } else if (snapshot->disable_wakeup) {
+            } else if (snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP) {
                 data = 0;
             } else {
                 continue;
@@ -758,7 +770,8 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
                 (unsigned long long)context->vctx.vctx_id,
                 (unsigned long long)context->vctx.generation,
                 (unsigned int)engine_index, (unsigned int)channel_index,
-                (unsigned int)data, (unsigned int)snapshot->disable_wakeup);
+                (unsigned int)data,
+                (unsigned int)!!(snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP));
         }
     }
     VCTX_TRACE("WAIT_DELIVER vctx=%llu generation=%llu channels=%u\n",
@@ -768,7 +781,8 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
 
     for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
-            u32 completed = completed_to_consume[engine_index][channel_index];
+            u32 wait_index = HAILO_VDMA_VCTX_WAIT_INDEX(engine_index, channel_index);
+            u8 completed = completed_to_consume[wait_index];
 
             if (completed) {
                 consume_completed(&context->vctx, engine_index, channel_index, completed);
@@ -787,12 +801,14 @@ restore_events:
             for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
                 struct hailo_vdma_vctx_event *event =
                     &context->vctx.events[engine_index][channel_index];
-                const struct hailo_vdma_vctx_event *snapshot =
-                    &snapshots[engine_index][channel_index];
+                u32 wait_index = HAILO_VDMA_VCTX_WAIT_INDEX(engine_index, channel_index);
+                u8 snapshot_flags = event_flags[wait_index];
 
-                event->channel_error |= snapshot->channel_error;
-                event->channel_inactive |= snapshot->channel_inactive;
-                event->disable_wakeup |= snapshot->disable_wakeup;
+                event->channel_error |= !!(snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_ERROR);
+                event->channel_inactive |=
+                    !!(snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_CHANNEL_INACTIVE);
+                event->disable_wakeup |=
+                    !!(snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP);
             }
         }
         spin_unlock_irqrestore(&context->vctx.lock, flags);
