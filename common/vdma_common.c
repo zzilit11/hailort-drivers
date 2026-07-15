@@ -445,7 +445,8 @@ int hailo_vdma_launch_transfer(
     bool should_bind,
     enum hailo_vdma_interrupts_domain first_interrupts_domain,
     enum hailo_vdma_interrupts_domain last_desc_interrupts,
-    bool is_debug)
+    bool is_debug,
+    void *transfer_opaque)
 {
     int ret = -EFAULT;
     u32 total_descs = 0;
@@ -484,7 +485,7 @@ int hailo_vdma_launch_transfer(
 
     BUILD_BUG_ON_MSG((HAILO_MAX_BUFFERS_PER_SINGLE_TRANSFER + 1) != ARRAY_SIZE(ongoing_transfer.dirty_descs),
         "Unexpected amount of dirty descriptors");
-    ongoing_transfer.dirty_descs_count = buffers_count + 1;
+    ongoing_transfer.dirty_descs_count = 1;
     ongoing_transfer.dirty_descs[0] = (u16)starting_desc;
 
     for (i = 0; i < buffers_count; i++) {
@@ -492,12 +493,17 @@ int hailo_vdma_launch_transfer(
             starting_desc, &buffers[i], should_bind, channel->index,
             (i == (buffers_count - 1) ? last_desc_interrupts : HAILO_VDMA_INTERRUPTS_DOMAIN_NONE),
             is_debug, DEFAULT_STRIDE);
+        if (ret < 0) {
+            clear_dirty_descs(channel, &ongoing_transfer);
+            return ret;
+        }
 
         total_descs += ret;
         last_desc = (starting_desc + ret - 1) % desc_list->desc_count;
         starting_desc = (starting_desc + ret) % desc_list->desc_count;
 
         ongoing_transfer.dirty_descs[i+1] = (u16)last_desc;
+        ongoing_transfer.dirty_descs_count++;
         ongoing_transfer.buffers[i] = buffers[i];
     }
     ongoing_transfer.buffers_count = buffers_count;
@@ -507,9 +513,11 @@ int hailo_vdma_launch_transfer(
 
     ongoing_transfer.last_desc = (u16)last_desc;
     ongoing_transfer.is_debug = is_debug;
+    ongoing_transfer.opaque = transfer_opaque;
     ret = ongoing_transfer_push(channel, &ongoing_transfer);
     if (ret < 0) {
         pr_err("Failed push ongoing transfer to channel %d\n", channel->index);
+        clear_dirty_descs(channel, &ongoing_transfer);
         return ret;
     }
 
@@ -642,7 +650,8 @@ void hailo_vdma_engine_enable_channels(struct hailo_vdma_engine *engine, u32 bit
  * @param bitmap - channels bitmap to enable.
  * @param measure_timestamp - if set, allow interrupts timestamp measure.
  */
-void hailo_vdma_engine_disable_channels(struct hailo_vdma_engine *engine, u32 bitmap)
+void hailo_vdma_engine_disable_channels_with_callback(struct hailo_vdma_engine *engine, u32 bitmap,
+    transfer_done_cb_t transfer_done, void *transfer_done_opaque)
 {
     struct hailo_vdma_channel *channel = NULL;
     u8 channel_index = 0;
@@ -659,15 +668,26 @@ void hailo_vdma_engine_disable_channels(struct hailo_vdma_engine *engine, u32 bi
 
                 if (channel->last_desc_list == NULL) {
                     pr_err("Channel %d has ongoing transfers but no desc list\n", channel->index);
+                    if (transfer_done) {
+                        transfer_done(&transfer, transfer_done_opaque);
+                    }
                     continue;
                 }
 
                 clear_dirty_descs(channel, &transfer);
+                if (transfer_done) {
+                    transfer_done(&transfer, transfer_done_opaque);
+                }
             }
 
             channel->last_desc_list = NULL;
         }
     }
+}
+
+void hailo_vdma_engine_disable_channels(struct hailo_vdma_engine *engine, u32 bitmap)
+{
+    hailo_vdma_engine_disable_channels_with_callback(engine, bitmap, NULL, NULL);
 }
 
 void hailo_vdma_engine_push_timestamps(struct hailo_vdma_engine *engine, u32 bitmap)
@@ -740,7 +760,7 @@ static u64 ioread64_safe(u8 *addr)
     return ((u64)ioread32(addr + 4) << 32) | ioread32(addr);
 }
 
-static void fill_channel_irq_data(struct hailo_vdma_interrupts_channel_data *irq_data,
+void hailo_vdma_channel_fill_irq_data(struct hailo_vdma_interrupts_channel_data *irq_data,
     struct hailo_vdma_engine *engine, struct hailo_vdma_channel *channel,
     transfer_done_cb_t transfer_done, void *transfer_done_opaque)
 {
@@ -776,7 +796,9 @@ static void fill_channel_irq_data(struct hailo_vdma_interrupts_channel_data *irq
         }
 
         clear_dirty_descs(channel, cur_transfer);
-        transfer_done(cur_transfer, transfer_done_opaque);
+        if (transfer_done) {
+            transfer_done(cur_transfer, transfer_done_opaque);
+        }
         channel->state.num_proc = (u16)((cur_transfer->last_desc + 1) & channel->state.desc_count_mask);
 
         ongoing_transfer_pop(channel, NULL);
@@ -823,7 +845,7 @@ int hailo_vdma_engine_fill_irq_data(struct hailo_vdma_interrupts_wait_params *ir
             return -EINVAL;
         }
 
-        fill_channel_irq_data(&irq_data->irq_data[irq_data->channels_count],
+        hailo_vdma_channel_fill_irq_data(&irq_data->irq_data[irq_data->channels_count],
             engine, channel, transfer_done, transfer_done_opaque);
         irq_data->channels_count++;
     }

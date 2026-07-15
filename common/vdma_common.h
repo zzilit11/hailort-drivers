@@ -75,6 +75,9 @@ struct hailo_vdma_mapped_transfer_buffer {
 struct hailo_ongoing_transfer {
     uint16_t last_desc;
 
+    // Driver-private transfer object. The common layer never dereferences it.
+    void *opaque;
+
     u8 buffers_count;
     struct hailo_vdma_mapped_transfer_buffer buffers[HAILO_MAX_BUFFERS_PER_SINGLE_TRANSFER];
 
@@ -247,6 +250,8 @@ u16 hailo_vdma_get_num_proc(u8 __iomem *regs);
  * @param last_desc_interrupts - interrupts settings on last descriptor.
  * @param is_debug program descriptors for debug run, adds some overhead (for
  *                 example, hw will write desc complete status).
+ * @param transfer_opaque driver-private owner/lifecycle object copied into the
+ *                        ongoing FIFO entry.
  *
  * @return On success - the amount of descriptors programmed, negative value on error.
  */
@@ -260,7 +265,8 @@ int hailo_vdma_launch_transfer(
     bool should_bind,
     enum hailo_vdma_interrupts_domain first_interrupts_domain,
     enum hailo_vdma_interrupts_domain last_desc_interrupts,
-    bool is_debug);
+    bool is_debug,
+    void *transfer_opaque);
 
 void hailo_vdma_engine_init(struct hailo_vdma_engine *engine, u8 engine_index,
     const struct hailo_resource *channel_registers, u32 src_channels_bitmask);
@@ -269,6 +275,11 @@ void hailo_vdma_engine_enable_channels(struct hailo_vdma_engine *engine, u32 bit
     bool measure_timestamp);
 
 void hailo_vdma_engine_disable_channels(struct hailo_vdma_engine *engine, u32 bitmap);
+
+typedef void(*transfer_done_cb_t)(struct hailo_ongoing_transfer *transfer, void *opaque);
+
+void hailo_vdma_engine_disable_channels_with_callback(struct hailo_vdma_engine *engine, u32 bitmap,
+    transfer_done_cb_t transfer_done, void *transfer_done_opaque);
 
 void hailo_vdma_engine_push_timestamps(struct hailo_vdma_engine *engine, u32 bitmap);
 int hailo_vdma_engine_read_timestamps(struct hailo_vdma_engine *engine,
@@ -299,7 +310,9 @@ static inline u32 hailo_vdma_engine_read_interrupts(struct hailo_vdma_engine *en
     return irq_channels_bitmap;
 }
 
-typedef void(*transfer_done_cb_t)(struct hailo_ongoing_transfer *transfer, void *opaque);
+void hailo_vdma_channel_fill_irq_data(struct hailo_vdma_interrupts_channel_data *irq_data,
+    struct hailo_vdma_engine *engine, struct hailo_vdma_channel *channel,
+    transfer_done_cb_t transfer_done, void *transfer_done_opaque);
 
 // Assuming irq_data->channels_count contains the amount of channels already
 // written (used for multiple engines).

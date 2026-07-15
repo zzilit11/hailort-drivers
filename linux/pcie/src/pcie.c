@@ -1173,6 +1173,7 @@ static int hailo_pcie_probe(struct pci_dev* pDev, const struct pci_device_id* id
     struct hailo_pcie_board * pBoard;
     struct device *char_device = NULL;
     int err = -EINVAL;
+    bool vdma_initialized = false;
 
     pci_notice(pDev, "Probing on: %04x:%04x...\n", pDev->vendor, pDev->device);
 #ifdef HAILO_EMULATOR
@@ -1237,6 +1238,7 @@ static int hailo_pcie_probe(struct pci_dev* pDev, const struct pci_device_id* id
         hailo_err(pBoard, "Failed init vdma controller %d\n", err);
         goto probe_release_pcie_resources;
     }
+    vdma_initialized = true;
 
     // Checks the dma mask => it must be called after the device's dma_mask is set by hailo_pcie_vdma_controller_init
     err = hailo_get_allocation_mode(pDev, &pBoard->allocation_mode);
@@ -1283,6 +1285,9 @@ probe_remove_board:
     hailo_pcie_remove_board(pBoard);
 
 probe_release_pcie_resources:
+    if (vdma_initialized) {
+        hailo_vdma_controller_cleanup(&pBoard->vdma);
+    }
     pcie_resources_release(pBoard->pDev, &pBoard->pcie_resources);
 
 probe_disable_device:
@@ -1314,6 +1319,8 @@ static void hailo_pcie_remove(struct pci_dev* pDev)
 
         // Disable interrupts - will only disable if they have not been disabled in release already
         hailo_disable_interrupts(pBoard);
+
+        hailo_vdma_controller_cleanup(&pBoard->vdma);
 
         pcie_resources_release(pBoard->pDev, &pBoard->pcie_resources);
 
@@ -1372,6 +1379,7 @@ static int hailo_pcie_suspend(struct device *dev)
 
     // Disable all interrupts. All interrupts from Hailo chip would be masked.
     hailo_disable_interrupts(board);
+    hailo_vdma_controller_reset(&board->vdma);
 
     // Un validate all activae file contexts so every new action would return error to the user.
     list_for_each_entry(cur, &board->open_files_list, open_files_list) {
@@ -1422,6 +1430,7 @@ static void hailo_pci_reset_prepare(struct pci_dev *pdev)
                 pci_err(pdev, "Error while trying to call FW to close vdma channels (errno %d)\n", err);
             }
         }
+        hailo_vdma_controller_reset(&board->vdma);
         up(&board->mutex);
     }
 }
@@ -1560,4 +1569,3 @@ MODULE_AUTHOR("Hailo Technologies Ltd.");
 MODULE_DESCRIPTION("Hailo PCIe driver");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION(HAILO_DRV_VER);
-

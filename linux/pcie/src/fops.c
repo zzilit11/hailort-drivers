@@ -58,7 +58,7 @@ static struct hailo_file_context *create_file_context(struct hailo_pcie_board *b
     }
 
     context->filp = filp;
-    hailo_vdma_file_context_init(&context->vdma_context);
+    hailo_vdma_file_context_init(&context->vdma_context, &board->vdma);
     list_add(&context->open_files_list, &board->open_files_list);
     context->is_valid = true;
     return context;

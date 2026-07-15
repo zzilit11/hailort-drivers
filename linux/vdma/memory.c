@@ -239,6 +239,10 @@ struct hailo_vdma_buffer *hailo_vdma_buffer_map(struct device *dev,
 
     kref_init(&mapped_buffer->kref);
     mapped_buffer->device = dev;
+    mapped_buffer->low_memory_buffer = low_mem_driver_allocated_buffer;
+    if (mapped_buffer->low_memory_buffer) {
+        hailo_vdma_low_memory_buffer_get(mapped_buffer->low_memory_buffer);
+    }
     mapped_buffer->buffer_type = buffer_type;
     mapped_buffer->size = size;
     mapped_buffer->addr_or_fd = addr_or_fd;
@@ -270,6 +274,9 @@ static void unmap_buffer(struct kref *kref)
         }
 
         clear_sg_table(&buf->sg_table);
+    }
+    if (buf->low_memory_buffer) {
+        hailo_vdma_low_memory_buffer_put(buf->low_memory_buffer);
     }
     kfree(buf);
 }
@@ -426,6 +433,8 @@ int hailo_desc_list_create(struct device *dev, u32 descriptors_count, u16 desc_p
     descriptors->desc_list.desc_count_mask = is_circular ? (descriptors_count - 1) : (get_nearest_powerof_2(descriptors_count) - 1);
     descriptors->desc_list.desc_page_size = desc_page_size;
     descriptors->desc_list.is_circular = is_circular;
+    descriptors->device = dev;
+    kref_init(&descriptors->kref);
 
     return 0;
 }
@@ -433,6 +442,27 @@ int hailo_desc_list_create(struct device *dev, u32 descriptors_count, u16 desc_p
 void hailo_desc_list_release(struct device *dev, struct hailo_descriptors_list_buffer *descriptors)
 {
     dma_free_coherent(dev, descriptors->buffer_size, descriptors->kernel_address, descriptors->dma_address);
+}
+
+static void release_descriptors(struct kref *kref)
+{
+    struct hailo_descriptors_list_buffer *descriptors =
+        container_of(kref, struct hailo_descriptors_list_buffer, kref);
+
+    hailo_desc_list_release(descriptors->device, descriptors);
+    if (descriptors->release_struct) {
+        kfree(descriptors);
+    }
+}
+
+void hailo_desc_list_get(struct hailo_descriptors_list_buffer *descriptors)
+{
+    kref_get(&descriptors->kref);
+}
+
+void hailo_desc_list_put(struct hailo_descriptors_list_buffer *descriptors)
+{
+    kref_put(&descriptors->kref, release_descriptors);
 }
 
 struct hailo_descriptors_list_buffer* hailo_vdma_find_descriptors_buffer(struct hailo_vdma_file_context *context,
@@ -451,10 +481,11 @@ void hailo_vdma_clear_descriptors_buffer_list(struct hailo_vdma_file_context *co
     struct hailo_vdma_controller *controller)
 {
     struct hailo_descriptors_list_buffer *cur = NULL, *next = NULL;
+
+    (void)controller;
     list_for_each_entry_safe(cur, next, &context->descriptors_buffer_list, descriptors_buffer_list) {
         list_del(&cur->descriptors_buffer_list);
-        hailo_desc_list_release(controller->dev, cur);
-        kfree(cur);
+        hailo_desc_list_put(cur);
     }
 }
 
@@ -488,6 +519,7 @@ int hailo_vdma_low_memory_buffer_alloc(size_t size, struct hailo_vdma_low_memory
 
     low_memory_buffer->pages_count = pages_count;
     low_memory_buffer->pages_address = pages;
+    kref_init(&low_memory_buffer->kref);
 
     return 0;
 
@@ -517,6 +549,25 @@ void hailo_vdma_low_memory_buffer_free(struct hailo_vdma_low_memory_buffer *low_
     kfree(low_memory_buffer->pages_address);
 }
 
+static void release_low_memory_buffer(struct kref *kref)
+{
+    struct hailo_vdma_low_memory_buffer *low_memory_buffer =
+        container_of(kref, struct hailo_vdma_low_memory_buffer, kref);
+
+    hailo_vdma_low_memory_buffer_free(low_memory_buffer);
+    kfree(low_memory_buffer);
+}
+
+void hailo_vdma_low_memory_buffer_get(struct hailo_vdma_low_memory_buffer *low_memory_buffer)
+{
+    kref_get(&low_memory_buffer->kref);
+}
+
+void hailo_vdma_low_memory_buffer_put(struct hailo_vdma_low_memory_buffer *low_memory_buffer)
+{
+    kref_put(&low_memory_buffer->kref, release_low_memory_buffer);
+}
+
 struct hailo_vdma_low_memory_buffer* hailo_vdma_find_low_memory_buffer(struct hailo_vdma_file_context *context,
     uintptr_t buf_handle)
 {
@@ -535,8 +586,7 @@ void hailo_vdma_clear_low_memory_buffer_list(struct hailo_vdma_file_context *con
     struct hailo_vdma_low_memory_buffer *cur = NULL, *next = NULL;
     list_for_each_entry_safe(cur, next, &context->vdma_low_memory_buffer_list, vdma_low_memory_buffer_list) {
         list_del(&cur->vdma_low_memory_buffer_list);
-        hailo_vdma_low_memory_buffer_free(cur);
-        kfree(cur);
+        hailo_vdma_low_memory_buffer_put(cur);
     }
 }
 

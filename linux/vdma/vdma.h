@@ -18,6 +18,10 @@
 #include <linux/semaphore.h>
 #include <linux/dma-buf.h>
 #include <linux/version.h>
+#include <linux/completion.h>
+#include <linux/kref.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
 
 #define VDMA_CHANNEL_CONTROL_REG_OFFSET(channel_index, direction) (((direction) == DMA_TO_DEVICE) ? \
             (((channel_index) << 5) + 0x0) : (((channel_index) << 5) + 0x10))
@@ -31,6 +35,8 @@
 
 #define DMA_DIRECTION_EQUALS(a, b) (a == DMA_BIDIRECTIONAL || b == DMA_BIDIRECTIONAL || a == b)
 
+struct hailo_vdma_file_context;
+struct hailo_vdma_low_memory_buffer;
 
 // dmabuf is supported from linux kernel version 3.3
 #if LINUX_VERSION_CODE < KERNEL_VERSION( 3, 3, 0 )
@@ -54,6 +60,8 @@ struct hailo_vdma_buffer {
 
     struct kref                 kref;
     struct device               *device;
+    struct hailo_vdma_file_context *owner;
+    struct hailo_vdma_low_memory_buffer *low_memory_buffer;
 
     enum hailo_dma_buffer_type  buffer_type;
     u32                         size;
@@ -80,10 +88,16 @@ struct hailo_descriptors_list_buffer {
     dma_addr_t                         dma_address;
     u32                                buffer_size;
     struct hailo_vdma_descriptors_list desc_list;
+    struct kref                        kref;
+    struct device                      *device;
+    struct hailo_vdma_file_context     *owner;
+    bool                               release_struct;
 };
 
 struct hailo_vdma_low_memory_buffer {
     struct list_head                    vdma_low_memory_buffer_list;
+    struct kref                         kref;
+    struct hailo_vdma_file_context      *owner;
     uintptr_t                           handle;
     size_t                              pages_count;
     void                                **pages_address;
@@ -92,12 +106,59 @@ struct hailo_vdma_low_memory_buffer {
 struct hailo_vdma_continuous_buffer {
     struct list_head    continuous_buffer_list;
     uintptr_t           handle;
+    struct hailo_vdma_file_context *owner;
     void                *kernel_address;
     dma_addr_t          dma_address;
     size_t              size;
 };
 
 struct hailo_vdma_controller;
+
+enum hailo_vdma_vctx_state {
+    HAILO_VDMA_VCTX_ACTIVE = 0,
+    HAILO_VDMA_VCTX_CLOSING,
+    HAILO_VDMA_VCTX_DEAD,
+};
+
+struct hailo_vdma_vctx_event {
+    u32 completed_count;
+    bool channel_error;
+    bool channel_inactive;
+    bool disable_wakeup;
+};
+
+struct hailo_vdma_vctx {
+    u64 vctx_id;
+    u64 generation;
+    enum hailo_vdma_vctx_state state;
+    struct kref refcount;
+    struct completion refs_zero;
+    spinlock_t lock;
+    wait_queue_head_t events_wq;
+    atomic64_t next_transfer_sequence;
+    atomic_t transfer_count;
+    u32 transfer_quota;
+    bool cancel_requested;
+    struct list_head queued_transfers;
+    struct list_head ongoing_transfers;
+    struct list_head completed_transfers[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+    struct hailo_vdma_vctx_event events[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+    struct hailo_vdma_controller *controller;
+};
+
+struct hailo_vdma_channel_context {
+    struct mutex lock;
+    spinlock_t admission_lock;
+    wait_queue_head_t admission_wq;
+    struct list_head admission_queue;
+    struct hailo_vdma_vctx *owner;
+    u64 owner_generation;
+    struct hailo_descriptors_list_buffer *bound_descriptors;
+    atomic_t ongoing_count;
+    bool enabled;
+    bool shutting_down;
+};
+
 struct hailo_vdma_controller_ops {
     void (*update_channel_interrupts)(struct hailo_vdma_controller *controller, size_t engine_index,
         u32 channels_bitmap);
@@ -114,6 +175,11 @@ struct hailo_vdma_controller {
     spinlock_t interrupts_lock;
     wait_queue_head_t interrupts_wq;
 
+    atomic64_t last_vctx_id;
+    struct work_struct completion_work;
+    bool completion_stopped;
+    struct hailo_vdma_channel_context channel_contexts[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+
     struct file *used_by_filp;
 
     // Putting big IOCTL structures here to avoid stack allocation.
@@ -125,6 +191,7 @@ struct hailo_vdma_controller {
         engine, engine_index)
 
 struct hailo_vdma_file_context {
+    struct hailo_vdma_vctx vctx;
     atomic_t last_vdma_user_buffer_handle;
     struct list_head mapped_user_buffer_list;
 
@@ -142,11 +209,14 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     struct device *dev, struct hailo_vdma_hw *vdma_hw,
     struct hailo_vdma_controller_ops *ops,
     struct hailo_resource *channel_registers_per_engine, size_t engines_count);
+void hailo_vdma_controller_cleanup(struct hailo_vdma_controller *controller);
+void hailo_vdma_controller_reset(struct hailo_vdma_controller *controller);
 
 void hailo_vdma_update_interrupts_mask(struct hailo_vdma_controller *controller,
     size_t engine_index);
 
-void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context);
+void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
+    struct hailo_vdma_controller *controller);
 void hailo_vdma_file_context_finalize(struct hailo_vdma_file_context *context,
     struct hailo_vdma_controller *controller, struct file *filp);
 
@@ -154,6 +224,9 @@ void hailo_vdma_wakeup_interrupts(struct hailo_vdma_controller *controller, stru
     u32 channels_bitmap);
 void hailo_vdma_irq_handler(struct hailo_vdma_controller *controller, size_t engine_index,
     u32 channels_bitmap);
+
+void hailo_vdma_vctx_get(struct hailo_vdma_vctx *vctx);
+void hailo_vdma_vctx_put(struct hailo_vdma_vctx *vctx);
 
 // TODO: reduce params count
 long hailo_vdma_ioctl(struct hailo_vdma_file_context *context, struct hailo_vdma_controller *controller,

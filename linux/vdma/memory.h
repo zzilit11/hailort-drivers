@@ -35,6 +35,8 @@ void hailo_vdma_clear_mapped_user_buffer_list(struct hailo_vdma_file_context *co
 int hailo_desc_list_create(struct device *dev, u32 descriptors_count, u16 desc_page_size,
     uintptr_t desc_handle, bool is_circular, struct hailo_descriptors_list_buffer *descriptors);
 void hailo_desc_list_release(struct device *dev, struct hailo_descriptors_list_buffer *descriptors);
+void hailo_desc_list_get(struct hailo_descriptors_list_buffer *descriptors);
+void hailo_desc_list_put(struct hailo_descriptors_list_buffer *descriptors);
 struct hailo_descriptors_list_buffer* hailo_vdma_find_descriptors_buffer(struct hailo_vdma_file_context *context,
     uintptr_t desc_handle);
 void hailo_vdma_clear_descriptors_buffer_list(struct hailo_vdma_file_context *context,
@@ -42,6 +44,8 @@ void hailo_vdma_clear_descriptors_buffer_list(struct hailo_vdma_file_context *co
 
 int hailo_vdma_low_memory_buffer_alloc(size_t size, struct hailo_vdma_low_memory_buffer *low_memory_buffer);
 void hailo_vdma_low_memory_buffer_free(struct hailo_vdma_low_memory_buffer *low_memory_buffer);
+void hailo_vdma_low_memory_buffer_get(struct hailo_vdma_low_memory_buffer *low_memory_buffer);
+void hailo_vdma_low_memory_buffer_put(struct hailo_vdma_low_memory_buffer *low_memory_buffer);
 struct hailo_vdma_low_memory_buffer* hailo_vdma_find_low_memory_buffer(struct hailo_vdma_file_context *context,
     uintptr_t buf_handle);
 void hailo_vdma_clear_low_memory_buffer_list(struct hailo_vdma_file_context *context);
