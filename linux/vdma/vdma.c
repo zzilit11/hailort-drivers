@@ -173,6 +173,8 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
 
     BUILD_BUG_ON_MSG(MAX_VDMA_CHANNELS_PER_ENGINE > sizeof(context->enabled_channels_bitmap[0]) * BITS_IN_BYTE,
         "Unexpected amount of VDMA channels per engine");
+
+    hailo_vdma_vctx_trace_created(&context->vctx);
 }
 
 void hailo_vdma_update_interrupts_mask(struct hailo_vdma_controller *controller,

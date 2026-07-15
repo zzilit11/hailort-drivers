@@ -11,10 +11,22 @@
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #define HAILO_VDMA_CHANNEL_TRANSFER_CAPACITY (HAILO_VDMA_MAX_ONGOING_TRANSFERS - 1)
+
+static bool vctx_trace_enabled;
+module_param_named(vctx_trace, vctx_trace_enabled, bool, 0644);
+MODULE_PARM_DESC(vctx_trace, "Enable Hailo VCTX lifecycle tracing in dmesg");
+
+#define VCTX_TRACE(fmt, ...) \
+    do { \
+        if (unlikely(READ_ONCE(vctx_trace_enabled))) \
+            pr_info("vctx-trace: " fmt, ##__VA_ARGS__); \
+    } while (0)
+
 enum hailo_vdma_transfer_state {
     HAILO_VDMA_TRANSFER_NEW = 0,
     HAILO_VDMA_TRANSFER_WAITING,
@@ -54,6 +66,13 @@ struct hailo_vdma_completion_context {
     struct hailo_vdma_controller *controller;
     bool publish_event;
 };
+
+void hailo_vdma_vctx_trace_created(struct hailo_vdma_vctx *vctx)
+{
+    VCTX_TRACE("VCTX_CREATE vctx=%llu generation=%llu quota=%u\n",
+        (unsigned long long)vctx->vctx_id,
+        (unsigned long long)vctx->generation, vctx->transfer_quota);
+}
 
 static bool vctx_is_active(struct hailo_vdma_vctx *vctx)
 {
@@ -179,6 +198,12 @@ static void transfer_abort_callback(struct hailo_ongoing_transfer *ongoing, void
     transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
     transfer_remove_from_vctx(transfer);
     atomic_dec(&channel_context->ongoing_count);
+    VCTX_TRACE("TRANSFER_ABORT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d\n",
+        (unsigned long long)transfer->vctx->vctx_id,
+        (unsigned long long)transfer->generation,
+        (unsigned long long)transfer->sequence,
+        (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+        transfer->status);
     transfer_destroy(transfer);
 }
 
@@ -190,6 +215,7 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
     struct hailo_vdma_channel_context *channel_context;
     unsigned long flags;
     bool publish;
+    u32 pending_count = 0;
     u8 i;
 
     if (!transfer) {
@@ -222,7 +248,7 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
         transfer->status = 0;
         list_add_tail(&transfer->completed_node,
             &vctx->completed_transfers[transfer->engine_index][transfer->channel_index]);
-        vctx->events[transfer->engine_index][transfer->channel_index].completed_count++;
+        pending_count = ++vctx->events[transfer->engine_index][transfer->channel_index].completed_count;
     } else {
         transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
         transfer->status = -ECANCELED;
@@ -230,6 +256,12 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
     spin_unlock_irqrestore(&vctx->lock, flags);
 
     atomic_dec(&channel_context->ongoing_count);
+    VCTX_TRACE("TRANSFER_COMPLETE vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u published=%u status=%d pending=%u\n",
+        (unsigned long long)vctx->vctx_id,
+        (unsigned long long)transfer->generation,
+        (unsigned long long)transfer->sequence,
+        (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+        (unsigned int)publish, transfer->status, pending_count);
     transfer_release_resources(transfer);
     wake_up_all(&channel_context->admission_wq);
     if (publish) {
@@ -298,6 +330,7 @@ static void disable_one_channel(struct hailo_vdma_controller *controller,
     struct hailo_vdma_vctx *owner;
     struct hailo_vdma_file_context *file_context;
     unsigned long flags;
+    u64 owner_generation;
     u32 channel_bit = BIT(channel_index);
 
     channel_context->shutting_down = true;
@@ -321,6 +354,7 @@ static void disable_one_channel(struct hailo_vdma_controller *controller,
     atomic_set(&channel_context->ongoing_count, 0);
 
     file_context = container_of(owner, struct hailo_vdma_file_context, vctx);
+    owner_generation = channel_context->owner_generation;
     file_context->enabled_channels_bitmap[engine_index] &= ~channel_bit;
     purge_completed_channel(owner, engine_index, channel_index, true);
     spin_lock_irqsave(&owner->lock, flags);
@@ -345,6 +379,10 @@ static void disable_one_channel(struct hailo_vdma_controller *controller,
         wake_up_interruptible_all(&owner->events_wq);
     }
     wake_up_all(&channel_context->admission_wq);
+    VCTX_TRACE("CHANNEL_DISABLE vctx=%llu generation=%llu engine=%u channel=%u notify=%u\n",
+        (unsigned long long)owner->vctx_id,
+        (unsigned long long)owner_generation, (unsigned int)engine_index,
+        (unsigned int)channel_index, (unsigned int)notify_waiter);
     hailo_vdma_vctx_put(owner);
 }
 
@@ -375,7 +413,19 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
             channel_context = &controller->channel_contexts[engine_index][channel_index];
             mutex_lock(&channel_context->lock);
             if (channel_context->enabled || channel_context->owner) {
+                u64 owner_vctx_id = channel_context->owner ?
+                    channel_context->owner->vctx_id : 0;
+                u64 owner_generation = channel_context->owner_generation;
+                bool enabled = channel_context->enabled;
+
                 mutex_unlock(&channel_context->lock);
+                VCTX_TRACE("CHANNEL_ENABLE_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u enabled=%u status=%d\n",
+                    (unsigned long long)context->vctx.vctx_id,
+                    (unsigned long long)context->vctx.generation,
+                    (unsigned long long)owner_vctx_id,
+                    (unsigned long long)owner_generation,
+                    (unsigned int)engine_index, (unsigned int)channel_index,
+                    (unsigned int)enabled, -EINVAL);
                 return -EINVAL;
             }
             mutex_unlock(&channel_context->lock);
@@ -406,6 +456,11 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
             channel_context->shutting_down = false;
             hailo_vdma_vctx_get(&context->vctx);
             mutex_unlock(&channel_context->lock);
+            VCTX_TRACE("CHANNEL_ENABLE vctx=%llu generation=%llu engine=%u channel=%u timestamps=%u\n",
+                (unsigned long long)context->vctx.vctx_id,
+                (unsigned long long)context->vctx.generation,
+                (unsigned int)engine_index, (unsigned int)channel_index,
+                (unsigned int)input.enable_timestamps_measure);
         }
         context->enabled_channels_bitmap[engine_index] |= bitmap;
         hailo_vdma_update_interrupts_mask(controller, engine_index);
@@ -436,7 +491,16 @@ long hailo_vdma_vctx_disable_channels(struct hailo_vdma_controller *controller,
             channel_context = &controller->channel_contexts[engine_index][channel_index];
             mutex_lock(&channel_context->lock);
             if (channel_context->owner && channel_context->owner != &context->vctx) {
+                u64 owner_vctx_id = channel_context->owner->vctx_id;
+                u64 owner_generation = channel_context->owner_generation;
+
                 mutex_unlock(&channel_context->lock);
+                VCTX_TRACE("CHANNEL_DISABLE_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u status=%d\n",
+                    (unsigned long long)context->vctx.vctx_id,
+                    (unsigned long long)context->vctx.generation,
+                    (unsigned long long)owner_vctx_id,
+                    (unsigned long long)owner_generation,
+                    (unsigned int)engine_index, (unsigned int)channel_index, -EPERM);
                 return -EPERM;
             }
             mutex_unlock(&channel_context->lock);
@@ -577,7 +641,16 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
             channel_context = &controller->channel_contexts[engine_index][channel_index];
             mutex_lock(&channel_context->lock);
             if (channel_context->owner && channel_context->owner != &context->vctx) {
+                u64 owner_vctx_id = channel_context->owner->vctx_id;
+                u64 owner_generation = channel_context->owner_generation;
+
                 mutex_unlock(&channel_context->lock);
+                VCTX_TRACE("WAIT_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u status=%d\n",
+                    (unsigned long long)context->vctx.vctx_id,
+                    (unsigned long long)context->vctx.generation,
+                    (unsigned long long)owner_vctx_id,
+                    (unsigned long long)owner_generation,
+                    (unsigned int)engine_index, (unsigned int)channel_index, -EPERM);
                 return -EPERM;
             }
             if (!channel_context->owner) {
@@ -663,6 +736,38 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
 
     for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
+            const struct hailo_vdma_vctx_event *snapshot =
+                &snapshots[engine_index][channel_index];
+            u32 completed = completed_to_consume[engine_index][channel_index];
+            u8 data;
+
+            if (!(params.channels_bitmap_per_engine[engine_index] & BIT(channel_index))) {
+                continue;
+            }
+            if (snapshot->channel_error || snapshot->channel_inactive) {
+                data = snapshot->channel_error ? HAILO_VDMA_TRANSFER_DATA_CHANNEL_WITH_ERROR :
+                    HAILO_VDMA_TRANSFER_DATA_CHANNEL_NOT_ACTIVE;
+            } else if (completed) {
+                data = (u8)completed;
+            } else if (snapshot->disable_wakeup) {
+                data = 0;
+            } else {
+                continue;
+            }
+            VCTX_TRACE("WAIT_EVENT vctx=%llu generation=%llu engine=%u channel=%u data=%u disabled=%u\n",
+                (unsigned long long)context->vctx.vctx_id,
+                (unsigned long long)context->vctx.generation,
+                (unsigned int)engine_index, (unsigned int)channel_index,
+                (unsigned int)data, (unsigned int)snapshot->disable_wakeup);
+        }
+    }
+    VCTX_TRACE("WAIT_DELIVER vctx=%llu generation=%llu channels=%u\n",
+        (unsigned long long)context->vctx.vctx_id,
+        (unsigned long long)context->vctx.generation,
+        (unsigned int)params.channels_count);
+
+    for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
+        for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
             u32 completed = completed_to_consume[engine_index][channel_index];
 
             if (completed) {
@@ -694,6 +799,9 @@ restore_events:
         unlock_wait_channels(controller, params.channels_bitmap_per_engine);
         wake_up_interruptible_all(&context->vctx.events_wq);
     }
+    VCTX_TRACE("WAIT_ROLLBACK vctx=%llu generation=%llu status=%ld\n",
+        (unsigned long long)context->vctx.vctx_id,
+        (unsigned long long)context->vctx.generation, err);
     return err;
 }
 
@@ -734,6 +842,12 @@ static void cancel_waiting_transfer(struct hailo_vdma_transfer *transfer,
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     transfer_remove_from_vctx(transfer);
     wake_up_all(&channel_context->admission_wq);
+    VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=wait\n",
+        (unsigned long long)transfer->vctx->vctx_id,
+        (unsigned long long)transfer->generation,
+        (unsigned long long)transfer->sequence,
+        (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+        transfer->status);
     transfer_destroy(transfer);
 }
 
@@ -817,7 +931,18 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     mutex_lock(&channel_context->lock);
     if (!channel_context->enabled || channel_context->owner != &context->vctx ||
         channel_context->owner_generation != context->vctx.generation) {
+        u64 owner_vctx_id = channel_context->owner ? channel_context->owner->vctx_id : 0;
+        u64 owner_generation = channel_context->owner_generation;
+        bool enabled = channel_context->enabled;
+
         mutex_unlock(&channel_context->lock);
+        VCTX_TRACE("TRANSFER_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u enabled=%u status=%d stage=lease\n",
+            (unsigned long long)context->vctx.vctx_id,
+            (unsigned long long)context->vctx.generation,
+            (unsigned long long)owner_vctx_id,
+            (unsigned long long)owner_generation,
+            (unsigned int)params.engine_index, (unsigned int)params.channel_index,
+            (unsigned int)enabled, -EPERM);
         return -EPERM;
     }
     mutex_unlock(&channel_context->lock);
@@ -840,11 +965,23 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
 
     err = transfer_acquire_resources(transfer, context, controller, &params);
     if (err) {
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%ld stage=resources\n",
+            (unsigned long long)transfer->vctx->vctx_id,
+            (unsigned long long)transfer->generation,
+            (unsigned long long)transfer->sequence,
+            (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+            err);
         hailo_vdma_vctx_put(&context->vctx);
         kfree(transfer);
         return err;
     }
     if (params.starting_desc >= transfer->descriptors->desc_list.desc_count) {
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=descriptor\n",
+            (unsigned long long)transfer->vctx->vctx_id,
+            (unsigned long long)transfer->generation,
+            (unsigned long long)transfer->sequence,
+            (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+            -EINVAL);
         transfer_destroy(transfer);
         return -EINVAL;
     }
@@ -855,6 +992,12 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         channel_context->shutting_down ||
         !vctx_generation_is_active(&context->vctx, transfer->generation)) {
         spin_unlock_irqrestore(&channel_context->admission_lock, flags);
+        VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=queue\n",
+            (unsigned long long)transfer->vctx->vctx_id,
+            (unsigned long long)transfer->generation,
+            (unsigned long long)transfer->sequence,
+            (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+            -ECANCELED);
         transfer_destroy(transfer);
         return -ECANCELED;
     }
@@ -864,6 +1007,12 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     spin_lock_irqsave(&context->vctx.lock, flags);
     list_add_tail(&transfer->vctx_node, &context->vctx.queued_transfers);
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    VCTX_TRACE("TRANSFER_QUEUE vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u start=%u buffers=%u\n",
+        (unsigned long long)transfer->vctx->vctx_id,
+        (unsigned long long)transfer->generation,
+        (unsigned long long)transfer->sequence,
+        (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+        transfer->starting_desc, (unsigned int)transfer->buffers_count);
     wake_up_all(&channel_context->admission_wq);
 
     for (;;) {
@@ -894,6 +1043,12 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             mutex_unlock(&channel_context->lock);
             transfer_remove_from_vctx(transfer);
+            VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=admission\n",
+                (unsigned long long)transfer->vctx->vctx_id,
+                (unsigned long long)transfer->generation,
+                (unsigned long long)transfer->sequence,
+                (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+                -ECANCELED);
             transfer_destroy(transfer);
             wake_up_all(&channel_context->admission_wq);
             return -ECANCELED;
@@ -905,6 +1060,13 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             atomic_read(&context->vctx.transfer_count) < context->vctx.transfer_quota) {
             transfer->state = HAILO_VDMA_TRANSFER_ADMITTED;
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
+            VCTX_TRACE("TRANSFER_ADMIT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u ongoing=%d quota=%d/%u\n",
+                (unsigned long long)transfer->vctx->vctx_id,
+                (unsigned long long)transfer->generation,
+                (unsigned long long)transfer->sequence,
+                (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+                atomic_read(&channel_context->ongoing_count),
+                atomic_read(&context->vctx.transfer_count), context->vctx.transfer_quota);
             break;
         }
         spin_unlock_irqrestore(&channel_context->admission_lock, flags);
@@ -944,6 +1106,13 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         list_del_init(&transfer->vctx_node);
         list_add_tail(&transfer->vctx_node, &context->vctx.ongoing_transfers);
         spin_unlock_irqrestore(&context->vctx.lock, flags);
+        VCTX_TRACE("TRANSFER_COMMIT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u descriptors=%u ongoing=%d quota=%d/%u\n",
+            (unsigned long long)transfer->vctx->vctx_id,
+            (unsigned long long)transfer->generation,
+            (unsigned long long)transfer->sequence,
+            (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+            transfer->programmed_descs, atomic_read(&channel_context->ongoing_count),
+            atomic_read(&context->vctx.transfer_count), context->vctx.transfer_quota);
     } else {
         transfer->status = err;
         transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
@@ -960,6 +1129,12 @@ commit_done:
 
     if (err < 0) {
         transfer_remove_from_vctx(transfer);
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%ld stage=commit\n",
+            (unsigned long long)transfer->vctx->vctx_id,
+            (unsigned long long)transfer->generation,
+            (unsigned long long)transfer->sequence,
+            (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
+            err);
         transfer_destroy(transfer);
     }
     return err;
@@ -1013,6 +1188,11 @@ void hailo_vdma_vctx_completion_work(struct work_struct *work)
                 hailo_vdma_engine_push_timestamps(engine, BIT(channel_index));
                 hailo_vdma_channel_fill_irq_data(&data, engine,
                     &engine->channels[channel_index], transfer_complete_callback, &completion);
+                VCTX_TRACE("WORKER_DRAIN vctx=%llu generation=%llu engine=%u channel=%u data=%u ongoing=%d\n",
+                    (unsigned long long)owner->vctx_id,
+                    (unsigned long long)channel_context->owner_generation,
+                    (unsigned int)engine_index, (unsigned int)channel_index,
+                    (unsigned int)data.data, atomic_read(&channel_context->ongoing_count));
                 if (data.data == HAILO_VDMA_TRANSFER_DATA_CHANNEL_WITH_ERROR ||
                     data.data == HAILO_VDMA_TRANSFER_DATA_CHANNEL_NOT_ACTIVE) {
                     set_channel_terminal_event(owner, engine_index, channel_index, data.data);
@@ -1039,6 +1219,9 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     context->vctx.cancel_requested = true;
     context->vctx.generation++;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    VCTX_TRACE("VCTX_CLOSE_BEGIN vctx=%llu generation=%llu\n",
+        (unsigned long long)context->vctx.vctx_id,
+        (unsigned long long)context->vctx.generation);
     wake_up_interruptible_all(&context->vctx.events_wq);
 
     for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
@@ -1067,6 +1250,9 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     spin_lock_irqsave(&context->vctx.lock, flags);
     context->vctx.state = HAILO_VDMA_VCTX_DEAD;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    VCTX_TRACE("VCTX_CLOSE_END vctx=%llu generation=%llu\n",
+        (unsigned long long)context->vctx.vctx_id,
+        (unsigned long long)context->vctx.generation);
 }
 
 static void controller_abort_channels(struct hailo_vdma_controller *controller,
@@ -1076,6 +1262,8 @@ static void controller_abort_channels(struct hailo_vdma_controller *controller,
     u8 engine_index;
     u8 channel_index;
 
+    VCTX_TRACE("CONTROLLER_ABORT_BEGIN permanent=%u engines=%u\n",
+        (unsigned int)permanently_stopped, (unsigned int)controller->vdma_engines_count);
     WRITE_ONCE(controller->completion_stopped, true);
     cancel_work_sync(&controller->completion_work);
     for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
@@ -1099,6 +1287,7 @@ static void controller_abort_channels(struct hailo_vdma_controller *controller,
     }
     WRITE_ONCE(controller->completion_stopped, permanently_stopped);
     spin_unlock_irqrestore(&controller->interrupts_lock, flags);
+    VCTX_TRACE("CONTROLLER_ABORT_END permanent=%u\n", (unsigned int)permanently_stopped);
 }
 
 void hailo_vdma_vctx_controller_quiesce(struct hailo_vdma_controller *controller)

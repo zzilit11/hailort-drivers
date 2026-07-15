@@ -21,6 +21,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     struct hailo_vdma_controller *controller, unsigned long arg,
     struct semaphore *board_mutex, bool *should_up_board_mutex);
 
+void hailo_vdma_vctx_trace_created(struct hailo_vdma_vctx *vctx);
 void hailo_vdma_vctx_completion_work(struct work_struct *work);
 void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     struct hailo_vdma_controller *controller);
