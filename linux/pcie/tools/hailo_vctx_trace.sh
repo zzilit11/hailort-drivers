@@ -5,6 +5,9 @@ set -Eeuo pipefail
 readonly MODULE_NAME="hailo_pci"
 readonly TRACE_PARAMETER="/sys/module/${MODULE_NAME}/parameters/vctx_trace"
 readonly TRACE_PATTERN='vctx-(trace|fw)'
+readonly TRACE_SESSION_UID="$(id -u)"
+readonly TRACE_STATE_FILE="${HAILO_VCTX_TRACE_STATE_FILE:-/tmp/hailo-vctx-trace-${TRACE_SESSION_UID}.state}"
+readonly TRACE_SHARED_LOG="${HAILO_VCTX_TRACE_LOG:-/tmp/hailo-vctx-trace-${TRACE_SESSION_UID}.log}"
 trace_use_sudo=0
 trace_producer_pid=""
 trace_consumer_pid=""
@@ -22,6 +25,11 @@ Usage: hailo_vctx_trace.sh [--authorize|--follow|--run]
 
 The inference application itself must remain a normal-user process. Only the
 sysfs write and restricted dmesg read are elevated when required.
+
+While following, the helper publishes an external trace session for the
+experiment matrix:
+  state: /tmp/hailo-vctx-trace-UID.state
+  log:   /tmp/hailo-vctx-trace-UID.log
 EOF
 }
 
@@ -105,6 +113,64 @@ write_trace_value()
     fi
 }
 
+read_state_pid()
+{
+    local state_file=$1
+
+    sed -n 's/^pid=//p' "${state_file}" 2>/dev/null | head -n 1
+}
+
+prepare_external_session()
+{
+    local existing_pid=""
+    local state_tmp="${TRACE_STATE_FILE}.tmp.$$"
+
+    if [[ -e "${TRACE_STATE_FILE}" ]]; then
+        existing_pid="$(read_state_pid "${TRACE_STATE_FILE}")"
+        if [[ "${existing_pid}" =~ ^[1-9][0-9]*$ ]] &&
+           kill -0 "${existing_pid}" 2>/dev/null; then
+            echo "ERROR: another VCTX trace session is active: pid=${existing_pid}" >&2
+            echo "State file: ${TRACE_STATE_FILE}" >&2
+            return 1
+        fi
+        rm -f -- "${TRACE_STATE_FILE}"
+    fi
+
+    : >"${TRACE_SHARED_LOG}"
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'log=%s\n' "${TRACE_SHARED_LOG}"
+        printf 'started_unix=%s\n' "$(date +%s)"
+    } >"${state_tmp}"
+    mv -f -- "${state_tmp}" "${TRACE_STATE_FILE}"
+}
+
+remove_external_session()
+{
+    local published_pid=""
+
+    if [[ -r "${TRACE_STATE_FILE}" ]]; then
+        published_pid="$(read_state_pid "${TRACE_STATE_FILE}")"
+    fi
+    if [[ "${published_pid}" == "$$" ]]; then
+        rm -f -- "${TRACE_STATE_FILE}"
+    fi
+}
+
+filter_trace_stream()
+{
+    local line
+
+    exec 3>>"${TRACE_SHARED_LOG}"
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ${TRACE_PATTERN} ]]; then
+            printf '%s\n' "${line}"
+            printf '%s\n' "${line}" >&3
+        fi
+    done
+    exec 3>&-
+}
+
 follow_trace()
 {
     local original_trace_value
@@ -149,6 +215,7 @@ follow_trace()
         [[ -n "${trace_consumer_pid}" ]] &&
             wait "${trace_consumer_pid}" 2>/dev/null || true
         restore_trace_value
+        remove_external_session
         [[ -n "${trace_fifo}" && -p "${trace_fifo}" ]] &&
             rm -f -- "${trace_fifo}" || true
         [[ -n "${trace_runtime_dir}" && -d "${trace_runtime_dir}" ]] &&
@@ -169,14 +236,16 @@ follow_trace()
     trace_runtime_dir="$(mktemp -d /tmp/hailo-vctx-trace.XXXXXX)"
     trace_fifo="${trace_runtime_dir}/dmesg.fifo"
     mkfifo -- "${trace_fifo}"
+    prepare_external_session
     if sudo_is_required; then
         sudo -n -- dmesg --follow-new >"${trace_fifo}" &
     else
         dmesg --follow-new >"${trace_fifo}" &
     fi
     trace_producer_pid=$!
-    grep -E --line-buffered "${TRACE_PATTERN}" <"${trace_fifo}" &
+    filter_trace_stream <"${trace_fifo}" &
     trace_consumer_pid=$!
+    echo "External VCTX trace ready: state=${TRACE_STATE_FILE} log=${TRACE_SHARED_LOG}" >&2
 
     if wait "${trace_consumer_pid}"; then
         consumer_status=0
