@@ -6,6 +6,10 @@ readonly MODULE_NAME="hailo_pci"
 readonly TRACE_PARAMETER="/sys/module/${MODULE_NAME}/parameters/vctx_trace"
 readonly TRACE_PATTERN='vctx-(trace|fw)'
 trace_use_sudo=0
+trace_producer_pid=""
+trace_consumer_pid=""
+trace_runtime_dir=""
+trace_fifo=""
 
 usage()
 {
@@ -13,7 +17,7 @@ usage()
 Usage: hailo_vctx_trace.sh [--authorize|--follow|--run]
 
   --authorize  Acquire/validate sudo credentials in the foreground, then exit.
-  --follow     Never prompt; enable vctx_trace and stream new VCTX dmesg events.
+  --follow     Never prompt; trace in the same login session as --authorize.
   --run        Authorize and follow (default; intended for direct terminal use).
 
 The inference application itself must remain a normal-user process. Only the
@@ -101,18 +105,11 @@ write_trace_value()
     fi
 }
 
-follow_dmesg()
-{
-    if sudo_is_required; then
-        sudo -n -- dmesg --follow-new
-    else
-        dmesg --follow-new
-    fi
-}
-
 follow_trace()
 {
     local original_trace_value
+    local producer_status=0
+    local consumer_status=0
 
     check_environment
     select_access_mode
@@ -131,15 +128,73 @@ follow_trace()
            ! write_trace_value "${original_trace_value}"; then
             echo "WARNING: failed to restore vctx_trace=${original_trace_value}." >&2
         fi
+        return 0
     }
-    trap restore_trace_value EXIT
+
+    cleanup_trace()
+    {
+        local exit_code=$?
+
+        trap - EXIT INT TERM
+        if [[ -n "${trace_producer_pid}" ]] &&
+           kill -0 "${trace_producer_pid}" 2>/dev/null; then
+            kill -TERM "${trace_producer_pid}" 2>/dev/null || true
+        fi
+        if [[ -n "${trace_consumer_pid}" ]] &&
+           kill -0 "${trace_consumer_pid}" 2>/dev/null; then
+            kill -TERM "${trace_consumer_pid}" 2>/dev/null || true
+        fi
+        [[ -n "${trace_producer_pid}" ]] &&
+            wait "${trace_producer_pid}" 2>/dev/null || true
+        [[ -n "${trace_consumer_pid}" ]] &&
+            wait "${trace_consumer_pid}" 2>/dev/null || true
+        restore_trace_value
+        [[ -n "${trace_fifo}" && -p "${trace_fifo}" ]] &&
+            rm -f -- "${trace_fifo}" || true
+        [[ -n "${trace_runtime_dir}" && -d "${trace_runtime_dir}" ]] &&
+            rmdir -- "${trace_runtime_dir}" 2>/dev/null || true
+        exit "${exit_code}"
+    }
+    trap cleanup_trace EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     write_trace_value 1
     echo "Enabled ${MODULE_NAME} vctx_trace; restoring vctx_trace=${original_trace_value} on exit." >&2
 
     # --follow-new excludes the existing kernel ring buffer so each case only
-    # contains messages emitted after its trace process starts.
-    follow_dmesg | grep -E --line-buffered "${TRACE_PATTERN}"
+    # contains messages emitted after its trace process starts. Keep producer
+    # and consumer PIDs explicit so the normal-user runner need not create a
+    # new session merely to clean up a privileged dmesg child.
+    trace_runtime_dir="$(mktemp -d /tmp/hailo-vctx-trace.XXXXXX)"
+    trace_fifo="${trace_runtime_dir}/dmesg.fifo"
+    mkfifo -- "${trace_fifo}"
+    if sudo_is_required; then
+        sudo -n -- dmesg --follow-new >"${trace_fifo}" &
+    else
+        dmesg --follow-new >"${trace_fifo}" &
+    fi
+    trace_producer_pid=$!
+    grep -E --line-buffered "${TRACE_PATTERN}" <"${trace_fifo}" &
+    trace_consumer_pid=$!
+
+    if wait "${trace_consumer_pid}"; then
+        consumer_status=0
+    else
+        consumer_status=$?
+    fi
+    trace_consumer_pid=""
+    if wait "${trace_producer_pid}"; then
+        producer_status=0
+    else
+        producer_status=$?
+    fi
+    trace_producer_pid=""
+    if (( producer_status != 0 )); then
+        echo "ERROR: dmesg follow process exited with status ${producer_status}." >&2
+        return "${producer_status}"
+    fi
+    return "${consumer_status}"
 }
 
 mode="${1:---run}"
