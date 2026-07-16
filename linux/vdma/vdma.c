@@ -98,6 +98,7 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     atomic64_set(&controller->last_vctx_id, 0);
     controller->completion_stopped = false;
     INIT_WORK(&controller->completion_work, hailo_vdma_vctx_completion_work);
+    hailo_vdma_vctx_stall_monitor_init(controller);
     for (engine_index = 0; engine_index < MAX_VDMA_ENGINES; engine_index++) {
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
             struct hailo_vdma_channel_context *channel_context =
@@ -132,17 +133,21 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
         hailo_dev_notice(controller->dev, "Probing: Using specialized dma_ops=%ps", get_dma_ops(controller->dev));
     }
 
+    hailo_vdma_vctx_stall_monitor_start(controller);
     return 0;
 }
 
 void hailo_vdma_controller_cleanup(struct hailo_vdma_controller *controller)
 {
+    hailo_vdma_vctx_stall_monitor_stop(controller);
     hailo_vdma_vctx_controller_quiesce(controller);
 }
 
 void hailo_vdma_controller_reset(struct hailo_vdma_controller *controller)
 {
+    hailo_vdma_vctx_stall_monitor_stop(controller);
     hailo_vdma_vctx_controller_reset(controller);
+    hailo_vdma_vctx_stall_monitor_start(controller);
 }
 
 void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,

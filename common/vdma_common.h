@@ -231,6 +231,8 @@ int hailo_vdma_program_descriptors_list_batch(
 
 void hailo_vdma_set_num_avail(u8 __iomem *regs, u16 num_avail);
 
+u16 hailo_vdma_get_num_avail(u8 __iomem *regs);
+
 u16 hailo_vdma_get_num_proc(u8 __iomem *regs);
 
 /**

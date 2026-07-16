@@ -430,6 +430,12 @@ void hailo_vdma_set_num_avail(u8 __iomem *regs, u16 num_avail)
         regs);
 }
 
+u16 hailo_vdma_get_num_avail(u8 __iomem *regs)
+{
+    return READ_BITS_AT_OFFSET(WORD_SIZE * BITS_IN_BYTE,
+        CHANNEL_NUM_AVAIL_OFFSET * BITS_IN_BYTE, ioread32(regs));
+}
+
 u16 hailo_vdma_get_num_proc(u8 __iomem *regs)
 {
     return READ_BITS_AT_OFFSET(WORD_SIZE * BITS_IN_BYTE, 0, ioread32(regs + CHANNEL_NUM_PROC_OFFSET));

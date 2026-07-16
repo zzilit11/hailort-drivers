@@ -207,6 +207,8 @@ struct hailo_vdma_controller {
     atomic64_t last_vctx_id;
     struct work_struct completion_work;
     bool completion_stopped;
+    struct delayed_work stall_monitor_work;
+    bool stall_monitor_stopped;
     struct hailo_vdma_channel_context channel_contexts[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
     struct mutex dispatch_lock;
     atomic_t total_ongoing_count;
