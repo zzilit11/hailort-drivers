@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly MODULE_NAME="hailo_pci"
 readonly TRACE_PARAMETER="/sys/module/${MODULE_NAME}/parameters/vctx_trace"
-readonly TRACE_PATTERN="vctx-trace"
+readonly TRACE_PATTERN='vctx-(trace|fw)'
 
 if [[ ! -e "${TRACE_PARAMETER}" ]]; then
     echo "Error: ${TRACE_PARAMETER} does not exist." >&2
@@ -30,4 +30,4 @@ trap restore_trace_value EXIT
 printf '1\n' | sudo tee "${TRACE_PARAMETER}" >/dev/null
 echo "Enabled ${MODULE_NAME} vctx_trace; press Ctrl+C to stop and restore vctx_trace=${original_trace_value}." >&2
 
-sudo dmesg -w | grep --line-buffered "${TRACE_PATTERN}"
+sudo dmesg -w | grep -E --line-buffered "${TRACE_PATTERN}"

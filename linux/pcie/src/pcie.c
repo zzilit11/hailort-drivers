@@ -1370,7 +1370,7 @@ static int hailo_pcie_suspend(struct device *dev)
     // lock board to wait for any pending operations
     down(&board->mutex);
 
-    if (board->vdma.used_by_filp != NULL) {
+    if (atomic_read(&board->vdma.registered_vctx_count) > 0) {
         err = driver_down(board);
         if (err < 0) {
             dev_notice(dev, "Error while trying to call FW to close vdma channels\n");
@@ -1380,6 +1380,9 @@ static int hailo_pcie_suspend(struct device *dev)
     // Disable all interrupts. All interrupts from Hailo chip would be masked.
     hailo_disable_interrupts(board);
     hailo_vdma_controller_reset(&board->vdma);
+    if (board->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
+        hailo_nnc_reset_virtualization_state(board);
+    }
 
     // Un validate all activae file contexts so every new action would return error to the user.
     list_for_each_entry(cur, &board->open_files_list, open_files_list) {
@@ -1423,7 +1426,7 @@ static void hailo_pci_reset_prepare(struct pci_dev *pdev)
     {
         // lock board to wait for any pending operations and for synchronization with open
         down(&board->mutex);
-        if (board->vdma.used_by_filp != NULL) {
+        if (atomic_read(&board->vdma.registered_vctx_count) > 0) {
             // Try to close all vDMA channels before reset
             err = driver_down(board);
             if (err < 0) {
@@ -1431,6 +1434,9 @@ static void hailo_pci_reset_prepare(struct pci_dev *pdev)
             }
         }
         hailo_vdma_controller_reset(&board->vdma);
+        if (board->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
+            hailo_nnc_reset_virtualization_state(board);
+        }
         up(&board->mutex);
     }
 }

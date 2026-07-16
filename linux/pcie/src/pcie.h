@@ -22,6 +22,13 @@
 #define HAILO_PCI_OVER_VDMA_NUM_CHANNELS                (8)
 #define HAILO_PCI_OVER_VDMA_PAGE_SIZE                   (512)
 
+enum hailo_nnc_device_lifecycle_state {
+    HAILO_NNC_DEVICE_COLD = 0,
+    HAILO_NNC_DEVICE_INITIALIZING,
+    HAILO_NNC_DEVICE_READY,
+    HAILO_NNC_DEVICE_ERROR,
+};
+
 struct hailo_fw_control_info {
     // protects that only one fw control will be send at a time
     struct semaphore    mutex;
@@ -29,6 +36,20 @@ struct hailo_fw_control_info {
     struct completion   completion;
     // the command we are currently handling
     struct hailo_fw_control command;
+    wait_queue_head_t owner_wq;
+    enum hailo_nnc_device_lifecycle_state device_state;
+    struct hailo_vdma_vctx *initialization_owner;
+    u64 initialization_generation;
+    struct hailo_vdma_vctx *configuration_owner;
+    u64 configuration_generation;
+    u16 expected_contexts;
+    u16 completed_contexts;
+    bool context_chunk_open;
+    u8 pending_local_application;
+    u8 pending_global_application;
+    u8 next_global_application;
+    bool pending_application_reserved;
+    u64 configuration_epoch;
 };
 
 struct hailo_pcie_driver_down_info {
@@ -127,4 +148,3 @@ struct hailo_pcie_board* hailo_pcie_get_board_index(u32 index);
 void hailo_disable_interrupts(struct hailo_pcie_board *board);
 int hailo_enable_interrupts(struct hailo_pcie_board *board);
 #endif /* _HAILO_PCI_PCIE_H_ */
-

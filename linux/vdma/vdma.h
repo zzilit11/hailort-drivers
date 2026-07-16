@@ -120,6 +120,15 @@ enum hailo_vdma_vctx_state {
     HAILO_VDMA_VCTX_DEAD,
 };
 
+enum hailo_vdma_vctx_fw_state {
+    HAILO_VDMA_VCTX_FW_UNCONFIGURED = 0,
+    HAILO_VDMA_VCTX_FW_CONFIGURING,
+    HAILO_VDMA_VCTX_FW_CONFIGURED,
+    HAILO_VDMA_VCTX_FW_RUNNABLE,
+    HAILO_VDMA_VCTX_FW_QUIESCING,
+    HAILO_VDMA_VCTX_FW_ERROR,
+};
+
 struct hailo_vdma_vctx_event {
     u32 completed_count;
     bool channel_error;
@@ -139,6 +148,15 @@ struct hailo_vdma_vctx {
     atomic_t transfer_count;
     u32 transfer_quota;
     bool cancel_requested;
+    bool resource_registered;
+    bool enable_timestamps_measure;
+    enum hailo_vdma_vctx_fw_state fw_state;
+    u64 fw_epoch;
+    u32 logical_channels_bitmap[MAX_VDMA_ENGINES];
+    struct hailo_vdma_channel_state channel_states[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+    bool channel_state_valid[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+    u8 application_count;
+    u8 application_map[CONTROL_PROTOCOL__MAX_CONTEXT_SWITCH_APPLICATIONS];
     struct list_head queued_transfers;
     struct list_head ongoing_transfers;
     struct list_head completed_transfers[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
@@ -153,8 +171,14 @@ struct hailo_vdma_channel_context {
     struct list_head admission_queue;
     struct hailo_vdma_vctx *owner;
     u64 owner_generation;
+    enum hailo_vdma_vctx_fw_state owner_fw_state;
+    bool owner_resource_registered;
+    bool owner_active;
     struct hailo_descriptors_list_buffer *bound_descriptors;
     atomic_t ongoing_count;
+    u32 logical_users;
+    u64 dispatch_sequence;
+    u64 last_dispatched_vctx_id;
     bool enabled;
     bool shutting_down;
 };
@@ -180,7 +204,7 @@ struct hailo_vdma_controller {
     bool completion_stopped;
     struct hailo_vdma_channel_context channel_contexts[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
 
-    struct file *used_by_filp;
+    atomic_t registered_vctx_count;
 
     // Putting big IOCTL structures here to avoid stack allocation.
     struct hailo_vdma_interrupts_read_timestamp_params read_interrupt_timestamps_params;
@@ -227,6 +251,8 @@ void hailo_vdma_irq_handler(struct hailo_vdma_controller *controller, size_t eng
 
 void hailo_vdma_vctx_get(struct hailo_vdma_vctx *vctx);
 void hailo_vdma_vctx_put(struct hailo_vdma_vctx *vctx);
+bool hailo_vdma_vctx_unregister(struct hailo_vdma_file_context *context,
+    struct hailo_vdma_controller *controller);
 
 // TODO: reduce params count
 long hailo_vdma_ioctl(struct hailo_vdma_file_context *context, struct hailo_vdma_controller *controller,

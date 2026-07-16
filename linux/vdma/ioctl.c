@@ -5,6 +5,7 @@
 
 #include "ioctl.h"
 #include "memory.h"
+#include "vctx.h"
 #include "utils/logs.h"
 #include "utils.h"
 
@@ -325,22 +326,52 @@ long hailo_vdma_low_memory_buffer_free_ioctl(struct hailo_vdma_file_context *con
     return 0;
 }
 
-long hailo_mark_as_in_use(struct hailo_vdma_controller *controller, unsigned long arg, struct file *filp)
+long hailo_mark_as_in_use(struct hailo_vdma_file_context *context,
+    struct hailo_vdma_controller *controller, unsigned long arg)
 {
     struct hailo_mark_as_in_use_params params = {0};
+    unsigned long flags;
+    bool newly_registered = false;
 
-    // If device is used by this FD, return false to indicate its free for usage
-    if (filp == controller->used_by_filp) {
-        params.in_use = false;
-    } else if (NULL != controller->used_by_filp) {
+    spin_lock_irqsave(&context->vctx.lock, flags);
+    if (context->vctx.state != HAILO_VDMA_VCTX_ACTIVE || context->vctx.cancel_requested ||
+        context->vctx.fw_state == HAILO_VDMA_VCTX_FW_ERROR) {
         params.in_use = true;
-    } else {
-        controller->used_by_filp = filp;
+    } else if (!context->vctx.resource_registered) {
+        context->vctx.resource_registered = true;
+        atomic_inc(&controller->registered_vctx_count);
+        newly_registered = true;
         params.in_use = false;
+    } else {
+        params.in_use = false;
+    }
+    spin_unlock_irqrestore(&context->vctx.lock, flags);
+
+    if (newly_registered) {
+        hailo_dev_notice(controller->dev,
+            "vctx-fw: register vctx=%llu generation=%llu registered=%d\n",
+            (unsigned long long)context->vctx.vctx_id,
+            (unsigned long long)context->vctx.generation,
+            atomic_read(&controller->registered_vctx_count));
+        hailo_vdma_vctx_fw_state_changed(&context->vctx);
     }
 
     if (copy_to_user((void __user*)arg, &params, sizeof(params))) {
         hailo_dev_err(controller->dev, "copy_to_user fail\n");
+        if (newly_registered) {
+            bool rollback_registration;
+
+            spin_lock_irqsave(&context->vctx.lock, flags);
+            rollback_registration = context->vctx.resource_registered;
+            if (rollback_registration) {
+                context->vctx.resource_registered = false;
+            }
+            spin_unlock_irqrestore(&context->vctx.lock, flags);
+            if (rollback_registration) {
+                atomic_dec(&controller->registered_vctx_count);
+                hailo_vdma_vctx_fw_state_changed(&context->vctx);
+            }
+        }
         return -EFAULT;
     }
 

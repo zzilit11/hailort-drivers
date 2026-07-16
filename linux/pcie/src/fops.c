@@ -255,19 +255,31 @@ static void firmware_notification_irq_handler(struct hailo_pcie_board *board)
 
     spin_lock_irqsave(&board->nnc.notification_read_spinlock, irq_saved_flags);
     err = hailo_pcie_read_firmware_notification(&board->pcie_resources.fw_access, &board->nnc.notification_cache);
-    spin_unlock_irqrestore(&board->nnc.notification_read_spinlock, irq_saved_flags);
-
-    if (err < 0) {
-        hailo_err(board, "Failed reading firmware notification");
-    }
-    else {
+    if (err >= 0) {
+        /* The payload is opaque here, so treat it as a device-global event and
+         * give every open file an independent cache/claim point. */
         // TODO: HRT-14502 move interrupt handling to nnc
         rcu_read_lock();
         list_for_each_entry_rcu(notif_wait_cursor, &board->nnc.notification_wait_list, notification_wait_list)
         {
-            complete(&notif_wait_cursor->notification_completion);
+            bool was_pending;
+
+            spin_lock(&notif_wait_cursor->notification_lock);
+            was_pending = notif_wait_cursor->has_notification;
+            memcpy(&notif_wait_cursor->notification, &board->nnc.notification_cache,
+                sizeof(notif_wait_cursor->notification));
+            notif_wait_cursor->has_notification = true;
+            if (!was_pending) {
+                complete(&notif_wait_cursor->notification_completion);
+            }
+            spin_unlock(&notif_wait_cursor->notification_lock);
         }
         rcu_read_unlock();
+    }
+    spin_unlock_irqrestore(&board->nnc.notification_read_spinlock, irq_saved_flags);
+
+    if (err < 0) {
+        hailo_err(board, "Failed reading firmware notification");
     }
 }
 

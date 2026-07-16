@@ -87,7 +87,7 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
         return PTR_ERR(controller->vdma_engines);
     }
 
-    controller->used_by_filp = NULL;
+    atomic_set(&controller->registered_vctx_count, 0);
     spin_lock_init(&controller->interrupts_lock);
     init_waitqueue_head(&controller->interrupts_wq);
     atomic64_set(&controller->last_vctx_id, 0);
@@ -104,8 +104,14 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
             INIT_LIST_HEAD(&channel_context->admission_queue);
             channel_context->owner = NULL;
             channel_context->owner_generation = 0;
+            channel_context->owner_fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
+            channel_context->owner_resource_registered = false;
+            channel_context->owner_active = false;
             channel_context->bound_descriptors = NULL;
             atomic_set(&channel_context->ongoing_count, 0);
+            channel_context->logical_users = 0;
+            channel_context->dispatch_sequence = 0;
+            channel_context->last_dispatched_vctx_id = 0;
             channel_context->enabled = false;
             channel_context->shutting_down = false;
         }
@@ -152,13 +158,24 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     context->vctx.transfer_quota = controller->vdma_engines_count *
         MAX_VDMA_CHANNELS_PER_ENGINE * (HAILO_VDMA_MAX_ONGOING_TRANSFERS - 1);
     context->vctx.cancel_requested = false;
+    context->vctx.resource_registered = false;
+    context->vctx.enable_timestamps_measure = false;
+    context->vctx.fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
+    context->vctx.fw_epoch = 0;
+    context->vctx.application_count = 0;
+    memset(context->vctx.application_map, 0xff, sizeof(context->vctx.application_map));
     context->vctx.controller = controller;
     memset(context->vctx.events, 0, sizeof(context->vctx.events));
     INIT_LIST_HEAD(&context->vctx.queued_transfers);
     INIT_LIST_HEAD(&context->vctx.ongoing_transfers);
     for (engine_index = 0; engine_index < MAX_VDMA_ENGINES; engine_index++) {
         context->enabled_channels_bitmap[engine_index] = 0;
+        context->vctx.logical_channels_bitmap[engine_index] = 0;
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
+            context->vctx.channel_states[engine_index][channel_index].num_avail = 0;
+            context->vctx.channel_states[engine_index][channel_index].num_proc = 0;
+            context->vctx.channel_states[engine_index][channel_index].desc_count_mask = U32_MAX;
+            context->vctx.channel_state_valid[engine_index][channel_index] = false;
             INIT_LIST_HEAD(&context->vctx.completed_transfers[engine_index][channel_index]);
         }
     }
@@ -187,6 +204,8 @@ void hailo_vdma_update_interrupts_mask(struct hailo_vdma_controller *controller,
 void hailo_vdma_file_context_finalize(struct hailo_vdma_file_context *context,
     struct hailo_vdma_controller *controller, struct file *filp)
 {
+    (void)filp;
+    hailo_vdma_vctx_unregister(context, controller);
     hailo_vdma_vctx_finalize(context, controller);
 
     hailo_vdma_clear_mapped_user_buffer_list(context, controller);
@@ -194,9 +213,24 @@ void hailo_vdma_file_context_finalize(struct hailo_vdma_file_context *context,
     hailo_vdma_clear_low_memory_buffer_list(context);
     hailo_vdma_clear_continuous_buffer_list(context, controller);
 
-    if (filp == controller->used_by_filp) {
-        controller->used_by_filp = NULL;
+}
+
+bool hailo_vdma_vctx_unregister(struct hailo_vdma_file_context *context,
+    struct hailo_vdma_controller *controller)
+{
+    unsigned long flags;
+    bool registered;
+
+    spin_lock_irqsave(&context->vctx.lock, flags);
+    registered = context->vctx.resource_registered;
+    context->vctx.resource_registered = false;
+    spin_unlock_irqrestore(&context->vctx.lock, flags);
+
+    if (!registered) {
+        return false;
     }
+    hailo_vdma_vctx_fw_state_changed(&context->vctx);
+    return atomic_dec_and_test(&controller->registered_vctx_count);
 }
 
 void hailo_vdma_wakeup_interrupts(struct hailo_vdma_controller *controller, struct hailo_vdma_engine *engine,
@@ -227,6 +261,7 @@ void hailo_vdma_irq_handler(struct hailo_vdma_controller *controller,
 long hailo_vdma_ioctl(struct hailo_vdma_file_context *context, struct hailo_vdma_controller *controller,
     unsigned int cmd, unsigned long arg, struct file *filp, struct semaphore *mutex, bool *should_up_board_mutex)
 {
+    (void)filp;
     switch (cmd) {
     case HAILO_VDMA_ENABLE_CHANNELS:
         return hailo_vdma_vctx_enable_channels(controller, arg, context);
@@ -253,7 +288,7 @@ long hailo_vdma_ioctl(struct hailo_vdma_file_context *context, struct hailo_vdma
     case HAILO_VDMA_LOW_MEMORY_BUFFER_FREE:
         return hailo_vdma_low_memory_buffer_free_ioctl(context, controller, arg);
     case HAILO_MARK_AS_IN_USE:
-        return hailo_mark_as_in_use(controller, arg, filp);
+        return hailo_mark_as_in_use(context, controller, arg);
     case HAILO_VDMA_CONTINUOUS_BUFFER_ALLOC:
         return hailo_vdma_continuous_buffer_alloc_ioctl(context, controller, arg);
     case HAILO_VDMA_CONTINUOUS_BUFFER_FREE:
