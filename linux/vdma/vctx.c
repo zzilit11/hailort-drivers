@@ -74,7 +74,7 @@ struct hailo_vdma_completion_context {
 
 void hailo_vdma_vctx_trace_created(struct hailo_vdma_vctx *vctx)
 {
-    VCTX_TRACE("VCTX_CREATE vctx=%llu generation=%llu quota=%u\n",
+    VCTX_TRACE("VCTX_CREATE vctx=%llu gen=%llu quota=%u\n",
         (unsigned long long)vctx->vctx_id,
         (unsigned long long)vctx->generation, vctx->transfer_quota);
 }
@@ -203,7 +203,7 @@ static void transfer_abort_callback(struct hailo_ongoing_transfer *ongoing, void
     transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
     transfer_remove_from_vctx(transfer);
     atomic_dec(&channel_context->ongoing_count);
-    VCTX_TRACE("TRANSFER_ABORT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d\n",
+    VCTX_TRACE("TRANSFER_ABORT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d\n",
         (unsigned long long)transfer->vctx->vctx_id,
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
@@ -261,7 +261,7 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
     spin_unlock_irqrestore(&vctx->lock, flags);
 
     atomic_dec(&channel_context->ongoing_count);
-    VCTX_TRACE("TRANSFER_COMPLETE vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u published=%u status=%d pending=%u\n",
+    VCTX_TRACE("TRANSFER_COMPLETE vctx=%llu gen=%llu seq=%llu engine=%u channel=%u published=%u status=%d pending=%u\n",
         (unsigned long long)vctx->vctx_id,
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
@@ -384,7 +384,7 @@ static void disable_one_channel(struct hailo_vdma_controller *controller,
         wake_up_interruptible_all(&owner->events_wq);
     }
     wake_up_all(&channel_context->admission_wq);
-    VCTX_TRACE("CHANNEL_DISABLE vctx=%llu generation=%llu engine=%u channel=%u notify=%u\n",
+    VCTX_TRACE("CHANNEL_DISABLE vctx=%llu gen=%llu engine=%u channel=%u notify=%u\n",
         (unsigned long long)owner->vctx_id,
         (unsigned long long)owner_generation, (unsigned int)engine_index,
         (unsigned int)channel_index, (unsigned int)notify_waiter);
@@ -424,7 +424,7 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
                 bool enabled = channel_context->enabled;
 
                 mutex_unlock(&channel_context->lock);
-                VCTX_TRACE("CHANNEL_ENABLE_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u enabled=%u status=%d\n",
+                VCTX_TRACE("CHANNEL_ENABLE_DENY requester=%llu gen=%llu owner=%llu owner_gen=%llu engine=%u channel=%u enabled=%u status=%d\n",
                     (unsigned long long)context->vctx.vctx_id,
                     (unsigned long long)context->vctx.generation,
                     (unsigned long long)owner_vctx_id,
@@ -461,7 +461,7 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
             channel_context->shutting_down = false;
             hailo_vdma_vctx_get(&context->vctx);
             mutex_unlock(&channel_context->lock);
-            VCTX_TRACE("CHANNEL_ENABLE vctx=%llu generation=%llu engine=%u channel=%u timestamps=%u\n",
+            VCTX_TRACE("CHANNEL_ENABLE vctx=%llu gen=%llu engine=%u channel=%u timestamps=%u\n",
                 (unsigned long long)context->vctx.vctx_id,
                 (unsigned long long)context->vctx.generation,
                 (unsigned int)engine_index, (unsigned int)channel_index,
@@ -500,7 +500,7 @@ long hailo_vdma_vctx_disable_channels(struct hailo_vdma_controller *controller,
                 u64 owner_generation = channel_context->owner_generation;
 
                 mutex_unlock(&channel_context->lock);
-                VCTX_TRACE("CHANNEL_DISABLE_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u status=%d\n",
+                VCTX_TRACE("CHANNEL_DISABLE_DENY requester=%llu gen=%llu owner=%llu owner_gen=%llu engine=%u channel=%u status=%d\n",
                     (unsigned long long)context->vctx.vctx_id,
                     (unsigned long long)context->vctx.generation,
                     (unsigned long long)owner_vctx_id,
@@ -650,7 +650,7 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
                 u64 owner_generation = channel_context->owner_generation;
 
                 mutex_unlock(&channel_context->lock);
-                VCTX_TRACE("WAIT_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u status=%d\n",
+                VCTX_TRACE("WAIT_DENY requester=%llu gen=%llu owner=%llu owner_gen=%llu engine=%u channel=%u status=%d\n",
                     (unsigned long long)context->vctx.vctx_id,
                     (unsigned long long)context->vctx.generation,
                     (unsigned long long)owner_vctx_id,
@@ -766,7 +766,7 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
             } else {
                 continue;
             }
-            VCTX_TRACE("WAIT_EVENT vctx=%llu generation=%llu engine=%u channel=%u data=%u disabled=%u\n",
+            VCTX_TRACE("WAIT_EVENT vctx=%llu gen=%llu engine=%u channel=%u data=%u disabled=%u\n",
                 (unsigned long long)context->vctx.vctx_id,
                 (unsigned long long)context->vctx.generation,
                 (unsigned int)engine_index, (unsigned int)channel_index,
@@ -774,7 +774,7 @@ long hailo_vdma_vctx_wait(struct hailo_vdma_file_context *context,
                 (unsigned int)!!(snapshot_flags & HAILO_VDMA_VCTX_WAIT_EVENT_DISABLE_WAKEUP));
         }
     }
-    VCTX_TRACE("WAIT_DELIVER vctx=%llu generation=%llu channels=%u\n",
+    VCTX_TRACE("WAIT_DELIVER vctx=%llu gen=%llu channels=%u\n",
         (unsigned long long)context->vctx.vctx_id,
         (unsigned long long)context->vctx.generation,
         (unsigned int)params.channels_count);
@@ -815,7 +815,7 @@ restore_events:
         unlock_wait_channels(controller, params.channels_bitmap_per_engine);
         wake_up_interruptible_all(&context->vctx.events_wq);
     }
-    VCTX_TRACE("WAIT_ROLLBACK vctx=%llu generation=%llu status=%ld\n",
+    VCTX_TRACE("WAIT_ROLLBACK vctx=%llu gen=%llu status=%ld\n",
         (unsigned long long)context->vctx.vctx_id,
         (unsigned long long)context->vctx.generation, err);
     return err;
@@ -858,7 +858,7 @@ static void cancel_waiting_transfer(struct hailo_vdma_transfer *transfer,
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     transfer_remove_from_vctx(transfer);
     wake_up_all(&channel_context->admission_wq);
-    VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=wait\n",
+    VCTX_TRACE("TRANSFER_CANCEL vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=wait\n",
         (unsigned long long)transfer->vctx->vctx_id,
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
@@ -952,7 +952,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         bool enabled = channel_context->enabled;
 
         mutex_unlock(&channel_context->lock);
-        VCTX_TRACE("TRANSFER_DENY requester=%llu generation=%llu owner=%llu owner_generation=%llu engine=%u channel=%u enabled=%u status=%d stage=lease\n",
+        VCTX_TRACE("TRANSFER_DENY requester=%llu gen=%llu owner=%llu owner_gen=%llu engine=%u channel=%u enabled=%u status=%d stage=lease\n",
             (unsigned long long)context->vctx.vctx_id,
             (unsigned long long)context->vctx.generation,
             (unsigned long long)owner_vctx_id,
@@ -981,7 +981,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
 
     err = transfer_acquire_resources(transfer, context, controller, &params);
     if (err) {
-        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%ld stage=resources\n",
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%ld stage=resources\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -992,7 +992,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         return err;
     }
     if (params.starting_desc >= transfer->descriptors->desc_list.desc_count) {
-        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=descriptor\n",
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=descriptor\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -1008,7 +1008,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         channel_context->shutting_down ||
         !vctx_generation_is_active(&context->vctx, transfer->generation)) {
         spin_unlock_irqrestore(&channel_context->admission_lock, flags);
-        VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=queue\n",
+        VCTX_TRACE("TRANSFER_CANCEL vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=queue\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -1023,7 +1023,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     spin_lock_irqsave(&context->vctx.lock, flags);
     list_add_tail(&transfer->vctx_node, &context->vctx.queued_transfers);
     spin_unlock_irqrestore(&context->vctx.lock, flags);
-    VCTX_TRACE("TRANSFER_QUEUE vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u start=%u buffers=%u\n",
+    VCTX_TRACE("TRANSFER_QUEUE vctx=%llu gen=%llu seq=%llu engine=%u channel=%u start=%u buffers=%u\n",
         (unsigned long long)transfer->vctx->vctx_id,
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
@@ -1059,7 +1059,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             mutex_unlock(&channel_context->lock);
             transfer_remove_from_vctx(transfer);
-            VCTX_TRACE("TRANSFER_CANCEL vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%d stage=admission\n",
+            VCTX_TRACE("TRANSFER_CANCEL vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=admission\n",
                 (unsigned long long)transfer->vctx->vctx_id,
                 (unsigned long long)transfer->generation,
                 (unsigned long long)transfer->sequence,
@@ -1076,7 +1076,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             atomic_read(&context->vctx.transfer_count) < context->vctx.transfer_quota) {
             transfer->state = HAILO_VDMA_TRANSFER_ADMITTED;
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
-            VCTX_TRACE("TRANSFER_ADMIT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u ongoing=%d quota=%d/%u\n",
+            VCTX_TRACE("TRANSFER_ADMIT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u ongoing=%d quota=%d/%u\n",
                 (unsigned long long)transfer->vctx->vctx_id,
                 (unsigned long long)transfer->generation,
                 (unsigned long long)transfer->sequence,
@@ -1122,7 +1122,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         list_del_init(&transfer->vctx_node);
         list_add_tail(&transfer->vctx_node, &context->vctx.ongoing_transfers);
         spin_unlock_irqrestore(&context->vctx.lock, flags);
-        VCTX_TRACE("TRANSFER_COMMIT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u descriptors=%u ongoing=%d quota=%d/%u\n",
+        VCTX_TRACE("TRANSFER_COMMIT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u descriptors=%u ongoing=%d quota=%d/%u\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -1145,7 +1145,7 @@ commit_done:
 
     if (err < 0) {
         transfer_remove_from_vctx(transfer);
-        VCTX_TRACE("TRANSFER_REJECT vctx=%llu generation=%llu sequence=%llu engine=%u channel=%u status=%ld stage=commit\n",
+        VCTX_TRACE("TRANSFER_REJECT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%ld stage=commit\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -1204,7 +1204,7 @@ void hailo_vdma_vctx_completion_work(struct work_struct *work)
                 hailo_vdma_engine_push_timestamps(engine, BIT(channel_index));
                 hailo_vdma_channel_fill_irq_data(&data, engine,
                     &engine->channels[channel_index], transfer_complete_callback, &completion);
-                VCTX_TRACE("WORKER_DRAIN vctx=%llu generation=%llu engine=%u channel=%u data=%u ongoing=%d\n",
+                VCTX_TRACE("WORKER_DRAIN vctx=%llu gen=%llu engine=%u channel=%u data=%u ongoing=%d\n",
                     (unsigned long long)owner->vctx_id,
                     (unsigned long long)channel_context->owner_generation,
                     (unsigned int)engine_index, (unsigned int)channel_index,
@@ -1235,7 +1235,7 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     context->vctx.cancel_requested = true;
     context->vctx.generation++;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
-    VCTX_TRACE("VCTX_CLOSE_BEGIN vctx=%llu generation=%llu\n",
+    VCTX_TRACE("VCTX_CLOSE_BEGIN vctx=%llu gen=%llu\n",
         (unsigned long long)context->vctx.vctx_id,
         (unsigned long long)context->vctx.generation);
     wake_up_interruptible_all(&context->vctx.events_wq);
@@ -1266,7 +1266,7 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     spin_lock_irqsave(&context->vctx.lock, flags);
     context->vctx.state = HAILO_VDMA_VCTX_DEAD;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
-    VCTX_TRACE("VCTX_CLOSE_END vctx=%llu generation=%llu\n",
+    VCTX_TRACE("VCTX_CLOSE_END vctx=%llu gen=%llu\n",
         (unsigned long long)context->vctx.vctx_id,
         (unsigned long long)context->vctx.generation);
 }
