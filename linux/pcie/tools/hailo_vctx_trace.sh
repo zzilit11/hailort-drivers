@@ -8,11 +8,11 @@ readonly TRACE_PATTERN='vctx-(trace|fw)'
 readonly TRACE_SESSION_UID="$(id -u)"
 readonly TRACE_STATE_FILE="${HAILO_VCTX_TRACE_STATE_FILE:-/tmp/hailo-vctx-trace-${TRACE_SESSION_UID}.state}"
 readonly TRACE_SHARED_LOG="${HAILO_VCTX_TRACE_LOG:-/tmp/hailo-vctx-trace-${TRACE_SESSION_UID}.log}"
+readonly TRACE_ERROR_LOG="${HAILO_VCTX_TRACE_ERROR_LOG:-/tmp/hailo-vctx-trace-${TRACE_SESSION_UID}.errors.log}"
+readonly TRACE_TERMINAL_ECHO="${HAILO_VCTX_TRACE_ECHO:-0}"
 trace_use_sudo=0
 trace_producer_pid=""
-trace_consumer_pid=""
-trace_runtime_dir=""
-trace_fifo=""
+trace_monitor_pid=""
 
 usage()
 {
@@ -29,7 +29,12 @@ sysfs write and restricted dmesg read are elevated when required.
 While following, the helper publishes an external trace session for the
 experiment matrix:
   state: /tmp/hailo-vctx-trace-UID.state
-  log:   /tmp/hailo-vctx-trace-UID.log
+  log:   /tmp/hailo-vctx-trace-UID.log (unfiltered dmesg stream)
+  error: /tmp/hailo-vctx-trace-UID.errors.log
+
+The kernel log is written directly to a file to avoid losing high-rate VCTX
+events. Set HAILO_VCTX_TRACE_ECHO=1 only when live terminal output is needed;
+terminal echo is disabled by default and never sits in the capture path.
 EOF
 }
 
@@ -47,6 +52,14 @@ check_environment()
     if ! dmesg --help 2>&1 | grep -q -- '--follow-new'; then
         echo "ERROR: this dmesg does not support --follow-new (-W)." >&2
         echo "Refusing to use -w because it would mix old messages into the experiment." >&2
+        exit 1
+    fi
+    if ! command -v stdbuf >/dev/null 2>&1; then
+        echo "ERROR: stdbuf is required for line-buffered dmesg capture." >&2
+        exit 1
+    fi
+    if [[ "${TRACE_TERMINAL_ECHO}" != "0" && "${TRACE_TERMINAL_ECHO}" != "1" ]]; then
+        echo "ERROR: HAILO_VCTX_TRACE_ECHO must be 0 or 1." >&2
         exit 1
     fi
 }
@@ -123,7 +136,6 @@ read_state_pid()
 prepare_external_session()
 {
     local existing_pid=""
-    local state_tmp="${TRACE_STATE_FILE}.tmp.$$"
 
     if [[ -e "${TRACE_STATE_FILE}" ]]; then
         existing_pid="$(read_state_pid "${TRACE_STATE_FILE}")"
@@ -137,9 +149,21 @@ prepare_external_session()
     fi
 
     : >"${TRACE_SHARED_LOG}"
+    : >"${TRACE_ERROR_LOG}"
+}
+
+publish_external_session()
+{
+    local state_tmp="${TRACE_STATE_FILE}.tmp.$$"
+
     {
+        printf 'format_version=2\n'
         printf 'pid=%s\n' "$$"
+        printf 'producer_pid=%s\n' "${trace_producer_pid}"
         printf 'log=%s\n' "${TRACE_SHARED_LOG}"
+        printf 'error_log=%s\n' "${TRACE_ERROR_LOG}"
+        printf 'log_format=raw-dmesg\n'
+        printf 'terminal_echo=%s\n' "${TRACE_TERMINAL_ECHO}"
         printf 'started_unix=%s\n' "$(date +%s)"
     } >"${state_tmp}"
     mv -f -- "${state_tmp}" "${TRACE_STATE_FILE}"
@@ -157,25 +181,21 @@ remove_external_session()
     fi
 }
 
-filter_trace_stream()
+monitor_trace_stream()
 {
     local line
 
-    exec 3>>"${TRACE_SHARED_LOG}"
     while IFS= read -r line; do
         if [[ "${line}" =~ ${TRACE_PATTERN} ]]; then
             printf '%s\n' "${line}"
-            printf '%s\n' "${line}" >&3
         fi
     done
-    exec 3>&-
 }
 
 follow_trace()
 {
     local original_trace_value
     local producer_status=0
-    local consumer_status=0
 
     check_environment
     select_access_mode
@@ -206,20 +226,16 @@ follow_trace()
            kill -0 "${trace_producer_pid}" 2>/dev/null; then
             kill -TERM "${trace_producer_pid}" 2>/dev/null || true
         fi
-        if [[ -n "${trace_consumer_pid}" ]] &&
-           kill -0 "${trace_consumer_pid}" 2>/dev/null; then
-            kill -TERM "${trace_consumer_pid}" 2>/dev/null || true
+        if [[ -n "${trace_monitor_pid}" ]] &&
+           kill -0 "${trace_monitor_pid}" 2>/dev/null; then
+            kill -TERM "${trace_monitor_pid}" 2>/dev/null || true
         fi
         [[ -n "${trace_producer_pid}" ]] &&
             wait "${trace_producer_pid}" 2>/dev/null || true
-        [[ -n "${trace_consumer_pid}" ]] &&
-            wait "${trace_consumer_pid}" 2>/dev/null || true
+        [[ -n "${trace_monitor_pid}" ]] &&
+            wait "${trace_monitor_pid}" 2>/dev/null || true
         restore_trace_value
         remove_external_session
-        [[ -n "${trace_fifo}" && -p "${trace_fifo}" ]] &&
-            rm -f -- "${trace_fifo}" || true
-        [[ -n "${trace_runtime_dir}" && -d "${trace_runtime_dir}" ]] &&
-            rmdir -- "${trace_runtime_dir}" 2>/dev/null || true
         exit "${exit_code}"
     }
     trap cleanup_trace EXIT
@@ -229,30 +245,39 @@ follow_trace()
     write_trace_value 1
     echo "Enabled ${MODULE_NAME} vctx_trace; restoring vctx_trace=${original_trace_value} on exit." >&2
 
-    # --follow-new excludes the existing kernel ring buffer so each case only
-    # contains messages emitted after its trace process starts. Keep producer
-    # and consumer PIDs explicit so the normal-user runner need not create a
-    # new session merely to clean up a privileged dmesg child.
-    trace_runtime_dir="$(mktemp -d /tmp/hailo-vctx-trace.XXXXXX)"
-    trace_fifo="${trace_runtime_dir}/dmesg.fifo"
-    mkfifo -- "${trace_fifo}"
+    # --follow-new excludes the existing kernel ring buffer. Write dmesg
+    # directly to the shared file: no shell regex loop, terminal, FIFO, or tee
+    # is allowed to apply backpressure to the privileged kernel-log reader.
     prepare_external_session
     if sudo_is_required; then
-        sudo -n -- dmesg --follow-new >"${trace_fifo}" &
+        sudo -n -- stdbuf -oL -eL dmesg --follow-new \
+            >>"${TRACE_SHARED_LOG}" 2>>"${TRACE_ERROR_LOG}" &
     else
-        dmesg --follow-new >"${trace_fifo}" &
+        stdbuf -oL -eL dmesg --follow-new \
+            >>"${TRACE_SHARED_LOG}" 2>>"${TRACE_ERROR_LOG}" &
     fi
     trace_producer_pid=$!
-    filter_trace_stream <"${trace_fifo}" &
-    trace_consumer_pid=$!
-    echo "External VCTX trace ready: state=${TRACE_STATE_FILE} log=${TRACE_SHARED_LOG}" >&2
-
-    if wait "${trace_consumer_pid}"; then
-        consumer_status=0
-    else
-        consumer_status=$?
+    sleep 0.05
+    if ! kill -0 "${trace_producer_pid}" 2>/dev/null; then
+        if wait "${trace_producer_pid}"; then
+            producer_status=0
+        else
+            producer_status=$?
+        fi
+        trace_producer_pid=""
+        echo "ERROR: dmesg follow process failed to start (status=${producer_status})." >&2
+        [[ -s "${TRACE_ERROR_LOG}" ]] && cat "${TRACE_ERROR_LOG}" >&2
+        return 1
     fi
-    trace_consumer_pid=""
+    publish_external_session
+
+    if [[ "${TRACE_TERMINAL_ECHO}" == "1" ]]; then
+        tail --pid="$$" -n 0 -F "${TRACE_SHARED_LOG}" 2>/dev/null |
+            monitor_trace_stream &
+        trace_monitor_pid=$!
+    fi
+    echo "External VCTX trace ready: state=${TRACE_STATE_FILE} log=${TRACE_SHARED_LOG} errors=${TRACE_ERROR_LOG} echo=${TRACE_TERMINAL_ECHO}" >&2
+
     if wait "${trace_producer_pid}"; then
         producer_status=0
     else
@@ -261,9 +286,10 @@ follow_trace()
     trace_producer_pid=""
     if (( producer_status != 0 )); then
         echo "ERROR: dmesg follow process exited with status ${producer_status}." >&2
+        [[ -s "${TRACE_ERROR_LOG}" ]] && cat "${TRACE_ERROR_LOG}" >&2
         return "${producer_status}"
     fi
-    return "${consumer_status}"
+    return 0
 }
 
 mode="${1:---run}"
