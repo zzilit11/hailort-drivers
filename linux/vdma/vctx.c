@@ -1646,6 +1646,15 @@ static unsigned long vctx_stall_monitor_interval_jiffies(void)
     return max_t(unsigned long, 1, msecs_to_jiffies(interval_ms));
 }
 
+static bool vctx_channel_has_ongoing_transfer(
+    const struct hailo_ongoing_transfers_list *transfers)
+{
+    /* The common VDMA circular-list macros are private to vdma_common.c.
+     * The monitor only needs the empty/non-empty state, for which head != tail
+     * is sufficient while channel_context->lock serializes list updates. */
+    return transfers->head != transfers->tail;
+}
+
 static void hailo_vdma_vctx_stall_monitor_work(struct work_struct *work)
 {
     struct delayed_work *delayed_work =
@@ -1679,7 +1688,8 @@ static void hailo_vdma_vctx_stall_monitor_work(struct work_struct *work)
 
                 mutex_lock(&channel_context->lock);
                 if (!channel_context->enabled ||
-                    !ONGOING_TRANSFERS_CIRC_CNT(channel->ongoing_transfers)) {
+                    !vctx_channel_has_ongoing_transfer(
+                        &channel->ongoing_transfers)) {
                     mutex_unlock(&channel_context->lock);
                     continue;
                 }
