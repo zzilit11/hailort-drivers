@@ -36,12 +36,18 @@ struct hailo_fw_control_info {
     struct completion   completion;
     // the command we are currently handling
     struct hailo_fw_control command;
+    // KMD-internal PAUSE/ENABLE command; never copied to a userspace ioctl.
+    struct hailo_fw_control dispatch_command;
     wait_queue_head_t owner_wq;
     enum hailo_nnc_device_lifecycle_state device_state;
     struct hailo_vdma_vctx *initialization_owner;
     u64 initialization_generation;
     struct hailo_vdma_vctx *configuration_owner;
     u64 configuration_generation;
+    struct hailo_vdma_vctx *active_owner;
+    u64 active_generation;
+    u8 active_global_application;
+    u64 active_epoch;
     u16 expected_contexts;
     u16 completed_contexts;
     bool context_chunk_open;
@@ -91,6 +97,7 @@ struct hailo_file_context {
     struct file *filp;
     struct hailo_vdma_file_context vdma_context;
     bool is_valid;
+    bool nnc_last_registered_vctx;
     u32 soc_used_channels_bitmap;
 };
 

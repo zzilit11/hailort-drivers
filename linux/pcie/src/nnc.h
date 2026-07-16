@@ -16,7 +16,10 @@ long hailo_nnc_ioctl(struct hailo_file_context *context, struct hailo_pcie_board
 
 int hailo_nnc_file_context_init(struct hailo_pcie_board *board, struct hailo_file_context *context);
 void hailo_nnc_file_context_finalize(struct hailo_pcie_board *board, struct hailo_file_context *context);
+void hailo_nnc_file_context_finalize_post_vdma(struct hailo_pcie_board *board,
+    struct hailo_file_context *context);
 void hailo_nnc_reset_virtualization_state(struct hailo_pcie_board *board);
+int hailo_nnc_activate_vctx(struct hailo_pcie_board *board, struct hailo_vdma_vctx *vctx);
 
 int hailo_nnc_driver_down(struct hailo_pcie_board *board);
 

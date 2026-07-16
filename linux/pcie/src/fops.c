@@ -12,6 +12,7 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/byteorder/generic.h>
 
 #include <asm/thread_info.h>
 
@@ -211,6 +212,9 @@ int hailo_pcie_fops_release(struct inode *inode, struct file *filp)
         }
 
         hailo_vdma_file_context_finalize(&context->vdma_context, &board->vdma, filp);
+        if (board->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
+            hailo_nnc_file_context_finalize_post_vdma(board, context);
+        }
         release_file_context(context);
 
         if (atomic_dec_and_test(&board->ref_count)) {
@@ -247,32 +251,174 @@ int hailo_pcie_fops_release(struct inode *inode, struct file *filp)
 
 
 
+enum hailo_notification_route {
+    HAILO_NOTIFICATION_ROUTE_GLOBAL = 0,
+    HAILO_NOTIFICATION_ROUTE_APPLICATION,
+    HAILO_NOTIFICATION_ROUTE_ACTIVE_VCTX,
+    HAILO_NOTIFICATION_ROUTE_DROP,
+};
+
+/* These IDs and the packed header layout are part of the Hailo D2H firmware
+ * protocol. Keep them KMD-private; no ioctl/UAPI layout is changed. */
+#define HAILO_D2H_EVENT_CONTEXT_SWITCH_BREAKPOINT_REACHED (9)
+#define HAILO_D2H_EVENT_HW_INFER_DONE                     (11)
+#define HAILO_D2H_EVENT_CONTEXT_SWITCH_RUNTIME_ERROR      (12)
+#define HAILO_D2H_EVENT_START_UPDATE_CACHE_OFFSET         (13)
+
+struct hailo_d2h_event_header {
+    __le32 version;
+    __le32 sequence;
+    __le32 priority;
+    __le32 module_id;
+    __le32 event_id;
+    __le32 parameter_count;
+    __le32 payload_length;
+} __packed;
+
+struct hailo_notification_route_info {
+    enum hailo_notification_route route;
+    size_t application_index_offset;
+    u8 global_application_index;
+};
+
+static struct hailo_notification_route_info hailo_classify_notification(
+    const struct hailo_d2h_notification *notification)
+{
+    struct hailo_notification_route_info info = {
+        .route = HAILO_NOTIFICATION_ROUTE_DROP,
+    };
+    struct hailo_d2h_event_header header;
+    size_t application_index_offset;
+    u32 payload_length;
+    u32 event_id;
+
+    if (notification->buffer_len < sizeof(header)) {
+        return info;
+    }
+    memcpy(&header, notification->buffer, sizeof(header));
+    event_id = le32_to_cpu(header.event_id);
+    payload_length = le32_to_cpu(header.payload_length);
+    if (payload_length > notification->buffer_len - sizeof(header)) {
+        return info;
+    }
+    switch (event_id) {
+    case HAILO_D2H_EVENT_CONTEXT_SWITCH_BREAKPOINT_REACHED:
+        application_index_offset = sizeof(header);
+        break;
+    case HAILO_D2H_EVENT_CONTEXT_SWITCH_RUNTIME_ERROR:
+        application_index_offset = sizeof(header) + sizeof(u32);
+        break;
+    case HAILO_D2H_EVENT_HW_INFER_DONE:
+    case HAILO_D2H_EVENT_START_UPDATE_CACHE_OFFSET:
+        info.route = HAILO_NOTIFICATION_ROUTE_ACTIVE_VCTX;
+        return info;
+    default:
+        /* IDs 0..8 and 10 are device health/communication events in the
+         * current protocol. Unknown future IDs are not broadcast. */
+        if (event_id <= 8 || event_id == 10) {
+            info.route = HAILO_NOTIFICATION_ROUTE_GLOBAL;
+        }
+        return info;
+    }
+    if (application_index_offset >= sizeof(header) + payload_length ||
+        application_index_offset >= notification->buffer_len) {
+        return info;
+    }
+    info.route = HAILO_NOTIFICATION_ROUTE_APPLICATION;
+    info.application_index_offset = application_index_offset;
+    info.global_application_index = notification->buffer[application_index_offset];
+    return info;
+}
+
+static bool hailo_vctx_global_to_local_application(struct hailo_vdma_vctx *vctx,
+    u8 global_application, u8 *local_application)
+{
+    unsigned long flags;
+    u8 index;
+    bool found = false;
+
+    spin_lock_irqsave(&vctx->lock, flags);
+    for (index = 0; index < vctx->application_count; index++) {
+        if (vctx->application_map[index] == global_application) {
+            *local_application = index;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&vctx->lock, flags);
+    return found;
+}
+
+static void hailo_enqueue_notification(struct hailo_notification_wait *wait,
+    const struct hailo_d2h_notification *notification, size_t application_index_offset,
+    bool rewrite_application, u8 local_application)
+{
+    bool was_empty;
+
+    spin_lock(&wait->notification_lock);
+    if (wait->is_disabled) {
+        spin_unlock(&wait->notification_lock);
+        return;
+    }
+    if (wait->notification_count == HAILO_NOTIFICATION_QUEUE_DEPTH) {
+        wait->dropped_notifications++;
+        spin_unlock(&wait->notification_lock);
+        return;
+    }
+
+    was_empty = wait->notification_count == 0;
+    memcpy(&wait->notifications[wait->notification_write_index], notification,
+        sizeof(*notification));
+    if (rewrite_application) {
+        wait->notifications[wait->notification_write_index]
+            .buffer[application_index_offset] = local_application;
+    }
+    wait->notification_write_index =
+        (wait->notification_write_index + 1) % HAILO_NOTIFICATION_QUEUE_DEPTH;
+    wait->notification_count++;
+    if (was_empty) {
+        complete(&wait->notification_completion);
+    }
+    spin_unlock(&wait->notification_lock);
+}
+
 static void firmware_notification_irq_handler(struct hailo_pcie_board *board)
 {
     struct hailo_notification_wait *notif_wait_cursor = NULL;
+    struct hailo_notification_route_info route_info;
+    u64 active_vctx_id;
     int err = 0;
     unsigned long irq_saved_flags = 0;
 
     spin_lock_irqsave(&board->nnc.notification_read_spinlock, irq_saved_flags);
     err = hailo_pcie_read_firmware_notification(&board->pcie_resources.fw_access, &board->nnc.notification_cache);
     if (err >= 0) {
-        /* The payload is opaque here, so treat it as a device-global event and
-         * give every open file an independent cache/claim point. */
+        route_info = hailo_classify_notification(&board->nnc.notification_cache);
+        active_vctx_id = atomic64_read(&board->vdma.notification_vctx_id);
         // TODO: HRT-14502 move interrupt handling to nnc
         rcu_read_lock();
         list_for_each_entry_rcu(notif_wait_cursor, &board->nnc.notification_wait_list, notification_wait_list)
         {
-            bool was_pending;
+            u8 local_application = 0;
+            bool deliver = false;
+            bool rewrite_application = false;
 
-            spin_lock(&notif_wait_cursor->notification_lock);
-            was_pending = notif_wait_cursor->has_notification;
-            memcpy(&notif_wait_cursor->notification, &board->nnc.notification_cache,
-                sizeof(notif_wait_cursor->notification));
-            notif_wait_cursor->has_notification = true;
-            if (!was_pending) {
-                complete(&notif_wait_cursor->notification_completion);
+            if (route_info.route == HAILO_NOTIFICATION_ROUTE_GLOBAL) {
+                deliver = true;
+            } else if (route_info.route == HAILO_NOTIFICATION_ROUTE_ACTIVE_VCTX) {
+                deliver = active_vctx_id != 0 &&
+                    active_vctx_id == notif_wait_cursor->vctx_id;
+            } else if (route_info.route == HAILO_NOTIFICATION_ROUTE_APPLICATION) {
+                deliver = hailo_vctx_global_to_local_application(notif_wait_cursor->vctx,
+                    route_info.global_application_index, &local_application);
+                rewrite_application = deliver;
             }
-            spin_unlock(&notif_wait_cursor->notification_lock);
+            if (deliver) {
+                hailo_enqueue_notification(notif_wait_cursor,
+                    &board->nnc.notification_cache,
+                    route_info.application_index_offset,
+                    rewrite_application, local_application);
+            }
         }
         rcu_read_unlock();
     }

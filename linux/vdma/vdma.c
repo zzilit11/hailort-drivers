@@ -88,6 +88,11 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     }
 
     atomic_set(&controller->registered_vctx_count, 0);
+    atomic_set(&controller->total_ongoing_count, 0);
+    atomic64_set(&controller->dispatched_vctx_id, 0);
+    atomic64_set(&controller->dispatched_generation, 0);
+    atomic64_set(&controller->notification_vctx_id, 0);
+    mutex_init(&controller->dispatch_lock);
     spin_lock_init(&controller->interrupts_lock);
     init_waitqueue_head(&controller->interrupts_wq);
     atomic64_set(&controller->last_vctx_id, 0);
@@ -164,6 +169,9 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     context->vctx.fw_epoch = 0;
     context->vctx.application_count = 0;
     memset(context->vctx.application_map, 0xff, sizeof(context->vctx.application_map));
+    context->vctx.activation_valid = false;
+    context->vctx.activation_request_len = 0;
+    memset(&context->vctx.activation_request, 0, sizeof(context->vctx.activation_request));
     context->vctx.controller = controller;
     memset(context->vctx.events, 0, sizeof(context->vctx.events));
     INIT_LIST_HEAD(&context->vctx.queued_transfers);

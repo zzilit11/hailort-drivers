@@ -30,6 +30,7 @@
 #include "utils/logs.h"
 #include "utils/compact.h"
 #include "vdma/vdma.h"
+#include "vdma/vctx.h"
 #include "vdma/memory.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION( 5, 4, 0 )
@@ -58,6 +59,8 @@ static struct class *g_chrdev_class = NULL;
 
 static LIST_HEAD(g_hailo_board_list);
 static struct semaphore g_hailo_add_board_mutex = __SEMAPHORE_INITIALIZER(g_hailo_add_board_mutex, 1);
+
+static void reset_open_file_vctx_channels(struct hailo_pcie_board *board);
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22))
 #define HAILO_IRQ_FLAGS (SA_SHIRQ | SA_INTERRUPT)
@@ -1095,8 +1098,21 @@ static void update_channel_interrupts(struct hailo_vdma_controller *controller,
     hailo_pcie_update_channel_interrupts_mask(&board->pcie_resources, channels_bitmap);
 }
 
+static int activate_vctx(struct hailo_vdma_controller *controller,
+    struct hailo_vdma_vctx *vctx)
+{
+    struct hailo_pcie_board *board =
+        (struct hailo_pcie_board *)dev_get_drvdata(controller->dev);
+
+    if (board->pcie_resources.accelerator_type != HAILO_ACCELERATOR_TYPE_NNC) {
+        return -EOPNOTSUPP;
+    }
+    return hailo_nnc_activate_vctx(board, vctx);
+}
+
 static struct hailo_vdma_controller_ops pcie_vdma_controller_ops = {
     .update_channel_interrupts = update_channel_interrupts,
+    .activate_vctx = activate_vctx,
 };
 
 
@@ -1303,6 +1319,7 @@ probe_exit:
 static void hailo_pcie_remove(struct pci_dev* pDev)
 {
     struct hailo_pcie_board* pBoard = (struct hailo_pcie_board*) pci_get_drvdata(pDev);
+    struct hailo_file_context *context;
 
     pci_notice(pDev, "Remove: Releasing board\n");
 
@@ -1317,10 +1334,25 @@ static void hailo_pcie_remove(struct pci_dev* pDev)
         // Delete the device node
         device_destroy(g_chrdev_class, MKDEV(char_major, pBoard->board_index));
 
+        list_for_each_entry(context, &pBoard->open_files_list, open_files_list) {
+            WRITE_ONCE(context->is_valid, false);
+        }
+        if (pBoard->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
+            /* FW ioctls release board->mutex while waiting for the firmware.
+             * Drain the current command before interrupts/resources disappear;
+             * queued commands observe is_valid=false and exit without I/O. */
+            down(&pBoard->nnc.fw_control.mutex);
+            up(&pBoard->nnc.fw_control.mutex);
+        }
+
         // Disable interrupts - will only disable if they have not been disabled in release already
         hailo_disable_interrupts(pBoard);
 
         hailo_vdma_controller_cleanup(&pBoard->vdma);
+        reset_open_file_vctx_channels(pBoard);
+        if (pBoard->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
+            hailo_nnc_reset_virtualization_state(pBoard);
+        }
 
         pcie_resources_release(pBoard->pDev, &pBoard->pcie_resources);
 
@@ -1360,6 +1392,15 @@ inline int driver_down(struct hailo_pcie_board *board)
     }
 }
 
+static void reset_open_file_vctx_channels(struct hailo_pcie_board *board)
+{
+    struct hailo_file_context *context;
+
+    list_for_each_entry(context, &board->open_files_list, open_files_list) {
+        hailo_vdma_vctx_reset_channels(&context->vdma_context, &board->vdma, true);
+    }
+}
+
 #ifdef CONFIG_PM_SLEEP
 static int hailo_pcie_suspend(struct device *dev)
 {
@@ -1380,6 +1421,7 @@ static int hailo_pcie_suspend(struct device *dev)
     // Disable all interrupts. All interrupts from Hailo chip would be masked.
     hailo_disable_interrupts(board);
     hailo_vdma_controller_reset(&board->vdma);
+    reset_open_file_vctx_channels(board);
     if (board->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
         hailo_nnc_reset_virtualization_state(board);
     }
@@ -1434,6 +1476,7 @@ static void hailo_pci_reset_prepare(struct pci_dev *pdev)
             }
         }
         hailo_vdma_controller_reset(&board->vdma);
+        reset_open_file_vctx_channels(board);
         if (board->pcie_resources.accelerator_type == HAILO_ACCELERATOR_TYPE_NNC) {
             hailo_nnc_reset_virtualization_state(board);
         }

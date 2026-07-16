@@ -157,6 +157,9 @@ struct hailo_vdma_vctx {
     bool channel_state_valid[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
     u8 application_count;
     u8 application_map[CONTROL_PROTOCOL__MAX_CONTEXT_SWITCH_APPLICATIONS];
+    bool activation_valid;
+    u32 activation_request_len;
+    CONTROL_PROTOCOL__request_t activation_request;
     struct list_head queued_transfers;
     struct list_head ongoing_transfers;
     struct list_head completed_transfers[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
@@ -186,6 +189,8 @@ struct hailo_vdma_channel_context {
 struct hailo_vdma_controller_ops {
     void (*update_channel_interrupts)(struct hailo_vdma_controller *controller, size_t engine_index,
         u32 channels_bitmap);
+    int (*activate_vctx)(struct hailo_vdma_controller *controller,
+        struct hailo_vdma_vctx *vctx);
 };
 
 struct hailo_vdma_controller {
@@ -203,6 +208,11 @@ struct hailo_vdma_controller {
     struct work_struct completion_work;
     bool completion_stopped;
     struct hailo_vdma_channel_context channel_contexts[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
+    struct mutex dispatch_lock;
+    atomic_t total_ongoing_count;
+    atomic64_t dispatched_vctx_id;
+    atomic64_t dispatched_generation;
+    atomic64_t notification_vctx_id;
 
     atomic_t registered_vctx_count;
 

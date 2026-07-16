@@ -34,6 +34,10 @@ void hailo_nnc_init(struct hailo_pcie_nnc *nnc)
     nnc->fw_control.initialization_generation = 0;
     nnc->fw_control.configuration_owner = NULL;
     nnc->fw_control.configuration_generation = 0;
+    nnc->fw_control.active_owner = NULL;
+    nnc->fw_control.active_generation = 0;
+    nnc->fw_control.active_global_application = 0xff;
+    nnc->fw_control.active_epoch = 0;
     nnc->fw_control.expected_contexts = 0;
     nnc->fw_control.completed_contexts = 0;
     nnc->fw_control.context_chunk_open = false;
@@ -58,7 +62,10 @@ struct hailo_fw_vctx_operation {
     bool runtime_reset;
     bool mapped_context_switch_status;
     bool mapped_hw_infer_status;
+    bool deferred_activation;
 };
+
+static int hailo_nnc_pause_active_vctx_locked(struct hailo_pcie_board *board);
 
 /*
  * fw_control.mutex protects both the shared command buffer and this KMD-only
@@ -141,10 +148,40 @@ static void hailo_fw_vctx_clear_applications(struct hailo_vdma_vctx *vctx)
     spin_lock_irqsave(&vctx->lock, flags);
     vctx->application_count = 0;
     memset(vctx->application_map, 0xff, sizeof(vctx->application_map));
+    vctx->activation_valid = false;
+    vctx->activation_request_len = 0;
     vctx->fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
     vctx->fw_epoch++;
     spin_unlock_irqrestore(&vctx->lock, flags);
     hailo_vdma_vctx_fw_state_changed(vctx);
+}
+
+static void hailo_fw_vctx_clear_activation(struct hailo_vdma_vctx *vctx)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&vctx->lock, flags);
+    vctx->activation_valid = false;
+    vctx->activation_request_len = 0;
+    spin_unlock_irqrestore(&vctx->lock, flags);
+}
+
+static void hailo_fw_vctx_release_active_owner(struct hailo_pcie_board *board)
+{
+    struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
+    struct hailo_vdma_vctx *owner = fw_control->active_owner;
+
+    fw_control->active_owner = NULL;
+    fw_control->active_generation = 0;
+    fw_control->active_global_application = 0xff;
+    fw_control->active_epoch++;
+    atomic64_set(&board->vdma.dispatched_vctx_id, 0);
+    atomic64_set(&board->vdma.dispatched_generation, 0);
+    atomic64_set(&board->vdma.notification_vctx_id, 0);
+    if (owner) {
+        hailo_vdma_vctx_put(owner);
+    }
+    hailo_vdma_vctx_wake_all_admission(&board->vdma);
 }
 
 static void hailo_fw_vctx_release_initialization_owner(struct hailo_fw_control_info *fw_control)
@@ -212,6 +249,10 @@ static int hailo_fw_vctx_prepare(struct hailo_file_context *context,
     int claim_result;
 
     memset(operation, 0, sizeof(*operation));
+    if (command->request_len < CONTROL_PROTOCOL__REQUEST_BASE_SIZE ||
+        command->request_len > sizeof(command->request)) {
+        return -EINVAL;
+    }
     operation->opcode = BYTE_ORDER__dtohl(request->opcode);
 
     switch (operation->opcode) {
@@ -222,6 +263,16 @@ static int hailo_fw_vctx_prepare(struct hailo_file_context *context,
         if (hailo_fw_vctx_application_count(vctx) != 0) {
             if (fw_control->initialization_owner) {
                 return -EBUSY;
+            }
+            if (fw_control->active_owner == vctx &&
+                atomic_read(&board->vdma.total_ongoing_count) != 0) {
+                return -EBUSY;
+            }
+            if (fw_control->active_owner == vctx) {
+                claim_result = hailo_nnc_pause_active_vctx_locked(board);
+                if (claim_result) {
+                    return claim_result;
+                }
             }
             operation->clear_configured_apps = true;
             if (atomic_read(&board->vdma.registered_vctx_count) > 1) {
@@ -263,6 +314,16 @@ static int hailo_fw_vctx_prepare(struct hailo_file_context *context,
         if (request->parameters.change_context_switch_status_request.state_machine_status ==
             CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_RESET && local_application == 0xff) {
             /* 0xff resets the global state machine; do not forward it over another VCTX. */
+            if (fw_control->active_owner == vctx &&
+                atomic_read(&board->vdma.total_ongoing_count) != 0) {
+                return -EBUSY;
+            }
+            if (fw_control->active_owner == vctx) {
+                claim_result = hailo_nnc_pause_active_vctx_locked(board);
+                if (claim_result) {
+                    return claim_result;
+                }
+            }
             operation->runtime_reset = true;
             operation->suppress = atomic_read(&board->vdma.registered_vctx_count) > 1;
             return 0;
@@ -272,15 +333,39 @@ static int hailo_fw_vctx_prepare(struct hailo_file_context *context,
         }
         request->parameters.change_context_switch_status_request.application_index = global_application;
         operation->mapped_context_switch_status = true;
+        if (request->parameters.change_context_switch_status_request.state_machine_status ==
+            CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_ENABLED) {
+            operation->deferred_activation = true;
+            operation->suppress = true;
+        } else if (request->parameters.change_context_switch_status_request.state_machine_status ==
+            CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_PAUSED) {
+            if (fw_control->active_owner == vctx &&
+                atomic_read(&board->vdma.total_ongoing_count) != 0) {
+                return -EBUSY;
+            }
+        }
         return 0;
 
     case HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS:
+        if (atomic_read(&board->vdma.registered_vctx_count) > 1 &&
+            request->parameters.change_hw_infer_status_request.hw_infer_state ==
+                CONTROL_PROTOCOL__HW_INFER_STATE_START) {
+            return -EOPNOTSUPP;
+        }
         local_application = request->parameters.change_hw_infer_status_request.application_index;
         if (hailo_fw_vctx_get_application(vctx, local_application, &global_application)) {
             return -EINVAL;
         }
         request->parameters.change_hw_infer_status_request.application_index = global_application;
         operation->mapped_hw_infer_status = true;
+        if (request->parameters.change_hw_infer_status_request.hw_infer_state ==
+            CONTROL_PROTOCOL__HW_INFER_STATE_START) {
+            operation->deferred_activation = true;
+            operation->suppress = true;
+        } else if (fw_control->active_owner == vctx &&
+            atomic_read(&board->vdma.total_ongoing_count) != 0) {
+            return -EBUSY;
+        }
         return 0;
 
     case HAILO_CONTROL_OPCODE_DOWNLOAD_CONTEXT_ACTION_LIST:
@@ -291,6 +376,30 @@ static int hailo_fw_vctx_prepare(struct hailo_file_context *context,
         }
         request->parameters.download_context_action_list_request.network_group_id =
             BYTE_ORDER__htodl(global_application);
+        return 0;
+
+    case HAILO_CONTROL_OPCODE_CONFIG_CONTEXT_SWITCH_BREAKPOINT:
+        if (atomic_read(&board->vdma.registered_vctx_count) > 1) {
+            return -EOPNOTSUPP;
+        }
+        if (!request->parameters.config_context_switch_breakpoint_request
+                .breakpoint_data.break_at_any_application_index) {
+            local_application = request->parameters.config_context_switch_breakpoint_request
+                .breakpoint_data.application_index;
+            if (hailo_fw_vctx_get_application(vctx, local_application, &global_application)) {
+                return -EINVAL;
+            }
+            request->parameters.config_context_switch_breakpoint_request
+                .breakpoint_data.application_index = global_application;
+        }
+        return 0;
+
+    case HAILO_CONTROL_OPCODE_GET_CONTEXT_SWITCH_BREAKPOINT_STATUS:
+    case HAILO_CONTROL_OPCODE_GET_CONTEXT_SWITCH_MAIN_HEADER:
+    case HAILO_CONTROL_OPCODE_CONFIG_CONTEXT_SWITCH_TIMESTAMP:
+        if (atomic_read(&board->vdma.registered_vctx_count) > 1) {
+            return -EOPNOTSUPP;
+        }
         return 0;
 
     case HAILO_CONTROL_OPCODE_CONTEXT_SWITCH_SET_NETWORK_GROUP_HEADER:
@@ -403,6 +512,10 @@ static void hailo_fw_vctx_complete(struct hailo_file_context *context,
         }
     }
     if (operation->runtime_reset) {
+        hailo_fw_vctx_clear_activation(vctx);
+        if (fw_control->active_owner == vctx) {
+            hailo_fw_vctx_release_active_owner(board);
+        }
         hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_CONFIGURED);
         if (operation->suppress) {
             hailo_notice(board, "vctx-fw: suppress global runtime reset vctx=%llu registered=%d\n",
@@ -411,6 +524,9 @@ static void hailo_fw_vctx_complete(struct hailo_file_context *context,
         }
     }
     if (operation->clear_configured_apps) {
+        if (fw_control->active_owner == vctx) {
+            hailo_fw_vctx_release_active_owner(board);
+        }
         hailo_fw_vctx_clear_applications(vctx);
         if (!operation->suppress) {
             fw_control->device_state = HAILO_NNC_DEVICE_READY;
@@ -427,8 +543,22 @@ static void hailo_fw_vctx_complete(struct hailo_file_context *context,
         u8 status = command->request.parameters.change_context_switch_status_request.state_machine_status;
 
         if (status == CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_ENABLED) {
+            unsigned long flags;
+
+            if (operation->deferred_activation) {
+                spin_lock_irqsave(&vctx->lock, flags);
+                memcpy(&vctx->activation_request, &command->request,
+                    sizeof(vctx->activation_request));
+                vctx->activation_request_len = command->request_len;
+                vctx->activation_valid = true;
+                spin_unlock_irqrestore(&vctx->lock, flags);
+            }
             hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_RUNNABLE);
         } else if (status == CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_PAUSED) {
+            hailo_fw_vctx_clear_activation(vctx);
+            if (fw_control->active_owner == vctx) {
+                hailo_fw_vctx_release_active_owner(board);
+            }
             hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_QUIESCING);
         } else {
             hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_CONFIGURED);
@@ -437,6 +567,21 @@ static void hailo_fw_vctx_complete(struct hailo_file_context *context,
     if (operation->mapped_hw_infer_status) {
         u8 status = command->request.parameters.change_hw_infer_status_request.hw_infer_state;
 
+        if (status == CONTROL_PROTOCOL__HW_INFER_STATE_START && operation->deferred_activation) {
+            unsigned long flags;
+
+            spin_lock_irqsave(&vctx->lock, flags);
+            memcpy(&vctx->activation_request, &command->request,
+                sizeof(vctx->activation_request));
+            vctx->activation_request_len = command->request_len;
+            vctx->activation_valid = true;
+            spin_unlock_irqrestore(&vctx->lock, flags);
+        } else if (status != CONTROL_PROTOCOL__HW_INFER_STATE_START) {
+            hailo_fw_vctx_clear_activation(vctx);
+            if (fw_control->active_owner == vctx) {
+                hailo_fw_vctx_release_active_owner(board);
+            }
+        }
         hailo_fw_vctx_set_state(vctx,
             status == CONTROL_PROTOCOL__HW_INFER_STATE_START ?
             HAILO_VDMA_VCTX_FW_RUNNABLE : HAILO_VDMA_VCTX_FW_CONFIGURED);
@@ -451,7 +596,13 @@ static void hailo_fw_vctx_fail(struct hailo_file_context *context,
 
     if (operation->initialization_reset || operation->clear_configured_apps) {
         fw_control->device_state = HAILO_NNC_DEVICE_ERROR;
+        hailo_fw_vctx_clear_activation(vctx);
+        hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_ERROR);
         hailo_fw_vctx_release_initialization_owner(fw_control);
+    }
+    if (operation->runtime_reset) {
+        hailo_fw_vctx_clear_activation(vctx);
+        hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_ERROR);
     }
     if (operation->configuration_header || operation->configuration_context_info) {
         hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_ERROR);
@@ -481,8 +632,13 @@ void hailo_nnc_finalize(struct hailo_pcie_nnc *nnc)
     rcu_read_unlock();
 }
 
-static void hailo_nnc_reset_virtualization_state_locked(struct hailo_fw_control_info *fw_control)
+static void hailo_nnc_reset_virtualization_state_locked(struct hailo_pcie_board *board)
 {
+    struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
+
+    if (fw_control->active_owner) {
+        hailo_fw_vctx_release_active_owner(board);
+    }
     if (fw_control->initialization_owner) {
         hailo_fw_vctx_release_initialization_owner(fw_control);
     }
@@ -506,7 +662,7 @@ void hailo_nnc_reset_virtualization_state(struct hailo_pcie_board *board)
     struct hailo_file_context *context;
 
     down(&board->nnc.fw_control.mutex);
-    hailo_nnc_reset_virtualization_state_locked(&board->nnc.fw_control);
+    hailo_nnc_reset_virtualization_state_locked(board);
     list_for_each_entry(context, &board->open_files_list, open_files_list) {
         struct hailo_vdma_vctx *vctx = &context->vdma_context.vctx;
         unsigned long flags;
@@ -516,6 +672,8 @@ void hailo_nnc_reset_virtualization_state(struct hailo_pcie_board *board)
         vctx->fw_epoch++;
         vctx->application_count = 0;
         memset(vctx->application_map, 0xff, sizeof(vctx->application_map));
+        vctx->activation_valid = false;
+        vctx->activation_request_len = 0;
         spin_unlock_irqrestore(&vctx->lock, flags);
         hailo_vdma_vctx_fw_state_changed(vctx);
     }
@@ -557,6 +715,210 @@ static int hailo_fw_control_preprocess(struct hailo_file_context *context, struc
     return 0;
 }
 
+static int hailo_fw_vctx_copy_activation(struct hailo_vdma_vctx *vctx,
+    struct hailo_fw_control *command, bool require_runnable)
+{
+    unsigned long flags;
+    int err = 0;
+
+    spin_lock_irqsave(&vctx->lock, flags);
+    if (vctx->state == HAILO_VDMA_VCTX_DEAD ||
+        (require_runnable && (vctx->state != HAILO_VDMA_VCTX_ACTIVE ||
+            vctx->fw_state != HAILO_VDMA_VCTX_FW_RUNNABLE)) ||
+        !vctx->activation_valid ||
+        vctx->activation_request_len < CONTROL_PROTOCOL__REQUEST_BASE_SIZE ||
+        vctx->activation_request_len > sizeof(vctx->activation_request)) {
+        err = -EINVAL;
+        goto exit;
+    }
+    memcpy(&command->request, &vctx->activation_request, sizeof(command->request));
+    command->request_len = vctx->activation_request_len;
+
+exit:
+    spin_unlock_irqrestore(&vctx->lock, flags);
+    return err;
+}
+
+/* fw_control.mutex serializes the shared command and firmware response buffer. */
+static int hailo_nnc_send_fw_control_locked(struct hailo_pcie_board *board,
+    struct hailo_fw_control *command)
+{
+    struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
+    long completion_result;
+    int err;
+
+    command->response_len = 0;
+    memset(&command->response, 0, sizeof(command->response));
+    reinit_completion(&fw_control->completion);
+
+    err = hailo_pcie_write_firmware_control(&board->pcie_resources, command);
+    if (err < 0) {
+        return err;
+    }
+    completion_result = wait_for_completion_timeout(
+        &fw_control->completion, msecs_to_jiffies(FW_CONTROL_DEFAULT_TIMEOUT_MS));
+    if (completion_result == 0) {
+        return -ETIMEDOUT;
+    }
+    err = hailo_pcie_read_firmware_control(&board->pcie_resources, command);
+    if (err < 0) {
+        return err;
+    }
+    if (command->response_len < sizeof(CONTROL_PROTOCOL__status_t)) {
+        return -EIO;
+    }
+    return hailo_fw_control_succeeded(command) ? 0 : -EIO;
+}
+
+static int hailo_nnc_pause_active_vctx_locked(struct hailo_pcie_board *board)
+{
+    struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
+    struct hailo_fw_control *command = &fw_control->dispatch_command;
+    struct hailo_vdma_vctx *owner = fw_control->active_owner;
+    u64 owner_id;
+    u64 owner_generation;
+    u32 opcode;
+    int err;
+
+    if (!owner) {
+        return 0;
+    }
+    if (atomic_read(&board->vdma.total_ongoing_count) != 0) {
+        return -EBUSY;
+    }
+
+    owner_id = owner->vctx_id;
+    owner_generation = fw_control->active_generation;
+    err = hailo_fw_vctx_copy_activation(owner, command, false);
+    if (err) {
+        goto release_owner;
+    }
+    opcode = BYTE_ORDER__dtohl(command->request.opcode);
+    if (opcode == HAILO_CONTROL_OPCODE_CHANGE_CONTEXT_SWITCH_STATUS) {
+        command->request.parameters.change_context_switch_status_request.state_machine_status =
+            CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_PAUSED;
+    } else if (opcode == HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS) {
+        command->request.parameters.change_hw_infer_status_request.hw_infer_state =
+            CONTROL_PROTOCOL__HW_INFER_STATE_STOP;
+    } else {
+        err = -EINVAL;
+        goto release_owner;
+    }
+
+    err = hailo_nnc_send_fw_control_locked(board, command);
+    if (!err) {
+        hailo_notice(board, "vctx-fw: pause vctx=%llu generation=%llu global_app=%u\n",
+            (unsigned long long)owner_id,
+            (unsigned long long)owner_generation,
+            fw_control->active_global_application);
+    }
+
+release_owner:
+    /* A failed/timeout PAUSE leaves the physical state uncertain. Clearing the
+     * dispatch owner forces the next transfer to send ENABLE again. */
+    hailo_fw_vctx_release_active_owner(board);
+    return err;
+}
+
+int hailo_nnc_activate_vctx(struct hailo_pcie_board *board, struct hailo_vdma_vctx *vctx)
+{
+    struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
+    struct hailo_fw_control *command = &fw_control->dispatch_command;
+    struct hailo_vdma_vctx *previous_owner;
+    u32 opcode;
+    int err = 0;
+
+    if (down_interruptible(&fw_control->mutex)) {
+        return -ERESTARTSYS;
+    }
+
+    if (atomic_read(&board->vdma.total_ongoing_count) != 0) {
+        err = -EAGAIN;
+        goto exit;
+    }
+    err = hailo_fw_vctx_copy_activation(vctx, command, true);
+    if (err) {
+        goto exit;
+    }
+    opcode = BYTE_ORDER__dtohl(command->request.opcode);
+    if (opcode != HAILO_CONTROL_OPCODE_CHANGE_CONTEXT_SWITCH_STATUS &&
+        opcode != HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS) {
+        err = -EINVAL;
+        goto exit;
+    }
+    if ((opcode == HAILO_CONTROL_OPCODE_CHANGE_CONTEXT_SWITCH_STATUS &&
+        command->request.parameters.change_context_switch_status_request.state_machine_status !=
+            CONTROL_PROTOCOL__CONTEXT_SWITCH_STATUS_ENABLED) ||
+        (opcode == HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS &&
+        command->request.parameters.change_hw_infer_status_request.hw_infer_state !=
+            CONTROL_PROTOCOL__HW_INFER_STATE_START)) {
+        err = -EINVAL;
+        goto exit;
+    }
+    if (opcode == HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS &&
+        atomic_read(&board->vdma.registered_vctx_count) > 1) {
+        err = -EOPNOTSUPP;
+        goto exit;
+    }
+    if (fw_control->active_owner == vctx &&
+        fw_control->active_generation == vctx->generation) {
+        atomic64_set(&board->vdma.dispatched_vctx_id, vctx->vctx_id);
+        atomic64_set(&board->vdma.dispatched_generation, vctx->generation);
+        atomic64_set(&board->vdma.notification_vctx_id, vctx->vctx_id);
+        goto exit;
+    }
+    if (fw_control->active_owner) {
+        err = hailo_nnc_pause_active_vctx_locked(board);
+        if (err) {
+            goto exit;
+        }
+    }
+
+    err = hailo_fw_vctx_copy_activation(vctx, command, true);
+    if (err) {
+        goto exit;
+    }
+    /* Activation can generate an application-less D2H event before its
+     * control response, so publish a notification-only target first. */
+    atomic64_set(&board->vdma.notification_vctx_id, vctx->vctx_id);
+    err = hailo_nnc_send_fw_control_locked(board, command);
+    if (err) {
+        atomic64_set(&board->vdma.notification_vctx_id, 0);
+        goto exit;
+    }
+
+    previous_owner = fw_control->active_owner;
+    if (previous_owner != vctx) {
+        hailo_vdma_vctx_get(vctx);
+        fw_control->active_owner = vctx;
+        if (previous_owner) {
+            hailo_vdma_vctx_put(previous_owner);
+        }
+    }
+    fw_control->active_generation = vctx->generation;
+    if (opcode == HAILO_CONTROL_OPCODE_CHANGE_CONTEXT_SWITCH_STATUS) {
+        fw_control->active_global_application =
+            command->request.parameters.change_context_switch_status_request.application_index;
+    } else if (opcode == HAILO_CONTROL_OPCODE_CHANGE_HW_INFER_STATUS) {
+        fw_control->active_global_application =
+            command->request.parameters.change_hw_infer_status_request.application_index;
+    }
+    fw_control->active_epoch++;
+    atomic64_set(&board->vdma.dispatched_vctx_id, vctx->vctx_id);
+    atomic64_set(&board->vdma.dispatched_generation, vctx->generation);
+    atomic64_set(&board->vdma.notification_vctx_id, vctx->vctx_id);
+    hailo_notice(board,
+        "vctx-fw: activate vctx=%llu generation=%llu global_app=%u epoch=%llu\n",
+        (unsigned long long)vctx->vctx_id,
+        (unsigned long long)vctx->generation,
+        fw_control->active_global_application,
+        (unsigned long long)fw_control->active_epoch);
+
+exit:
+    up(&fw_control->mutex);
+    return err;
+}
+
 static int hailo_fw_control(struct hailo_file_context *context, struct hailo_pcie_board *board, unsigned long arg,
     bool* should_up_board_mutex)
 {
@@ -575,6 +937,10 @@ retry_owner:
         hailo_info(board, "hailo_fw_control down_interruptible fail tgid:%d (process was interrupted or killed)\n",
             current->tgid);
         return -ERESTARTSYS;
+    }
+    if (!READ_ONCE(context->is_valid) || !READ_ONCE(board->pDev)) {
+        err = -ENODEV;
+        goto l_exit;
     }
     if (hailo_fw_vctx_owner_conflicts(fw_control, vctx)) {
         up(&fw_control->mutex);
@@ -668,7 +1034,8 @@ copy_response:
 l_exit:
     if (err < 0 && !operation.suppress &&
         (operation.initialization_reset || operation.clear_configured_apps ||
-        operation.configuration_header || operation.configuration_context_info)) {
+        operation.configuration_header || operation.configuration_context_info ||
+        operation.runtime_reset)) {
         hailo_fw_vctx_fail(context, board, &operation);
     }
     up(&fw_control->mutex);
@@ -682,7 +1049,7 @@ static long hailo_get_notification_wait_thread(struct hailo_pcie_board *board, s
     // note: safe to access without rcu because the notification_wait_list is closed only on file release
     list_for_each_entry(cursor, &board->nnc.notification_wait_list, notification_wait_list)
     {
-        if ((current->tgid == cursor->tgid) && (filp == cursor->filp)) {
+        if (filp == cursor->filp) {
             *current_waiting_thread = cursor;
             return 0;
         }
@@ -719,6 +1086,10 @@ static long hailo_read_notification_ioctl(struct hailo_pcie_board *board, unsign
         err = -ERESTARTSYS;
         goto l_exit;
     }
+    if (!READ_ONCE(board->pDev)) {
+        err = -ENODEV;
+        goto l_exit;
+    }
 
     spin_lock_irqsave(&current_waiting_thread->notification_lock, irq_saved_flags);
     if (current_waiting_thread->is_disabled) {
@@ -727,24 +1098,43 @@ static long hailo_read_notification_ioctl(struct hailo_pcie_board *board, unsign
         err = -ECANCELED;
         goto l_exit;
     }
-    if (!current_waiting_thread->has_notification) {
+    if (current_waiting_thread->notification_count == 0) {
         spin_unlock_irqrestore(&current_waiting_thread->notification_lock, irq_saved_flags);
         err = -EAGAIN;
         goto l_exit;
     }
-    memcpy(notification, &current_waiting_thread->notification, sizeof(*notification));
-    current_waiting_thread->has_notification = false;
-    reinit_completion(&current_waiting_thread->notification_completion);
+    memcpy(notification,
+        &current_waiting_thread->notifications[current_waiting_thread->notification_read_index],
+        sizeof(*notification));
+    current_waiting_thread->notification_read_index =
+        (current_waiting_thread->notification_read_index + 1) % HAILO_NOTIFICATION_QUEUE_DEPTH;
+    current_waiting_thread->notification_count--;
+    if (current_waiting_thread->notification_count > 0) {
+        complete(&current_waiting_thread->notification_completion);
+    } else {
+        reinit_completion(&current_waiting_thread->notification_completion);
+    }
     spin_unlock_irqrestore(&current_waiting_thread->notification_lock, irq_saved_flags);
 
     if (copy_to_user((void __user*)arg, notification, sizeof(*notification))) {
+        bool was_empty;
+
         hailo_err(board, "HAILO_READ_NOTIFICATION copy_to_user fail\n");
         spin_lock_irqsave(&current_waiting_thread->notification_lock, irq_saved_flags);
-        if (!current_waiting_thread->has_notification) {
-            memcpy(&current_waiting_thread->notification, notification,
-                sizeof(current_waiting_thread->notification));
-            current_waiting_thread->has_notification = true;
-            complete(&current_waiting_thread->notification_completion);
+        if (current_waiting_thread->notification_count < HAILO_NOTIFICATION_QUEUE_DEPTH) {
+            was_empty = current_waiting_thread->notification_count == 0;
+            current_waiting_thread->notification_read_index =
+                (current_waiting_thread->notification_read_index +
+                    HAILO_NOTIFICATION_QUEUE_DEPTH - 1) % HAILO_NOTIFICATION_QUEUE_DEPTH;
+            memcpy(&current_waiting_thread->notifications[
+                    current_waiting_thread->notification_read_index],
+                notification, sizeof(*notification));
+            current_waiting_thread->notification_count++;
+            if (was_empty) {
+                complete(&current_waiting_thread->notification_completion);
+            }
+        } else {
+            current_waiting_thread->dropped_notifications++;
         }
         spin_unlock_irqrestore(&current_waiting_thread->notification_lock, irq_saved_flags);
         err = -EFAULT;
@@ -763,7 +1153,7 @@ static long hailo_disable_notification(struct hailo_pcie_board *board, struct fi
     hailo_info(board, "HAILO_DISABLE_NOTIFICATION: disable notification");
     rcu_read_lock();
     list_for_each_entry_rcu(cursor, &board->nnc.notification_wait_list, notification_wait_list) {
-        if ((current->tgid == cursor->tgid) && (filp == cursor->filp)) {
+        if (filp == cursor->filp) {
             spin_lock_irqsave(&cursor->notification_lock, flags);
             cursor->is_disabled = true;
             complete(&cursor->notification_completion);
@@ -817,7 +1207,8 @@ long hailo_nnc_ioctl(struct hailo_file_context *context, struct hailo_pcie_board
 }
 
 
-static int add_notification_wait(struct hailo_pcie_board *board, struct file *filp)
+static int add_notification_wait(struct hailo_pcie_board *board,
+    struct hailo_file_context *context)
 {
     struct hailo_notification_wait *wait = kmalloc(sizeof(*wait), GFP_KERNEL);
     if (!wait) {
@@ -825,11 +1216,16 @@ static int add_notification_wait(struct hailo_pcie_board *board, struct file *fi
         return -ENOMEM;
     }
     wait->tgid = current->tgid;
-    wait->filp = filp;
+    wait->filp = context->filp;
     wait->is_disabled = false;
-    wait->has_notification = false;
-    wait->vctx_id = 0;
-    memset(&wait->notification, 0, sizeof(wait->notification));
+    wait->notification_read_index = 0;
+    wait->notification_write_index = 0;
+    wait->notification_count = 0;
+    wait->dropped_notifications = 0;
+    wait->vctx = &context->vdma_context.vctx;
+    wait->vctx_id = wait->vctx->vctx_id;
+    memset(wait->notifications, 0, sizeof(wait->notifications));
+    hailo_vdma_vctx_get(wait->vctx);
     spin_lock_init(&wait->notification_lock);
     init_completion(&wait->notification_completion);
     list_add_rcu(&wait->notification_wait_list, &board->nnc.notification_wait_list);
@@ -838,18 +1234,10 @@ static int add_notification_wait(struct hailo_pcie_board *board, struct file *fi
 
 int hailo_nnc_file_context_init(struct hailo_pcie_board *board, struct hailo_file_context *context)
 {
-    int err = add_notification_wait(board, context->filp);
-    struct hailo_notification_wait *wait;
+    int err = add_notification_wait(board, context);
 
     if (err) {
         return err;
-    }
-    wait = NULL;
-    list_for_each_entry(wait, &board->nnc.notification_wait_list, notification_wait_list) {
-        if (wait->filp == context->filp) {
-            wait->vctx_id = context->vdma_context.vctx.vctx_id;
-            break;
-        }
     }
     return 0;
 }
@@ -861,6 +1249,12 @@ static void clear_notification_wait_list(struct hailo_pcie_board *board, struct 
         if (cur->filp == filp) {
             list_del_rcu(&cur->notification_wait_list);
             synchronize_rcu();
+            if (cur->dropped_notifications) {
+                pr_warn("hailo: vctx-fw: notification queue dropped=%u vctx=%llu\n",
+                    cur->dropped_notifications,
+                    (unsigned long long)cur->vctx_id);
+            }
+            hailo_vdma_vctx_put(cur->vctx);
             kfree(cur);
         }
     }
@@ -898,7 +1292,8 @@ void hailo_nnc_file_context_finalize(struct hailo_pcie_board *board, struct hail
 {
     struct hailo_fw_control_info *fw_control = &board->nnc.fw_control;
     struct hailo_vdma_vctx *vctx = &context->vdma_context.vctx;
-    bool last_registered_vctx;
+    bool is_active_owner;
+    int err;
 
     clear_notification_wait_list(board, context->filp);
 
@@ -911,10 +1306,44 @@ void hailo_nnc_file_context_finalize(struct hailo_pcie_board *board, struct hail
         hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_ERROR);
         hailo_fw_vctx_release_configuration_owner(fw_control);
     }
+    is_active_owner = fw_control->active_owner == vctx;
+    if (is_active_owner) {
+        hailo_fw_vctx_set_state(vctx, HAILO_VDMA_VCTX_FW_QUIESCING);
+    }
     up(&fw_control->mutex);
 
-    last_registered_vctx = hailo_vdma_vctx_unregister(&context->vdma_context, &board->vdma);
-    if (last_registered_vctx) {
+    /* PAUSE is device-global and is only safe after this VCTX has no DMA in flight. */
+    if (is_active_owner) {
+        hailo_vdma_vctx_reset_channels(&context->vdma_context, &board->vdma, true);
+    }
+
+    down(&fw_control->mutex);
+    if (fw_control->active_owner == vctx) {
+        err = hailo_nnc_pause_active_vctx_locked(board);
+        if (err) {
+            if (board->pDev) {
+                hailo_warn(board, "vctx-fw: close pause failed vctx=%llu status=%d\n",
+                    (unsigned long long)vctx->vctx_id, err);
+            } else {
+                pr_warn("hailo: vctx-fw: close pause failed vctx=%llu status=%d\n",
+                    (unsigned long long)vctx->vctx_id, err);
+            }
+            if (fw_control->active_owner == vctx) {
+                hailo_fw_vctx_release_active_owner(board);
+            }
+        }
+    }
+    hailo_fw_vctx_clear_activation(vctx);
+    up(&fw_control->mutex);
+
+    context->nnc_last_registered_vctx =
+        hailo_vdma_vctx_unregister(&context->vdma_context, &board->vdma);
+}
+
+void hailo_nnc_file_context_finalize_post_vdma(struct hailo_pcie_board *board,
+    struct hailo_file_context *context)
+{
+    if (context->nnc_last_registered_vctx) {
         if (board->pDev) {
             hailo_nnc_driver_down(board);
         }

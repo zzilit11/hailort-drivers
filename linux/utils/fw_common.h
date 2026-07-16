@@ -13,15 +13,23 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 
+#define HAILO_NOTIFICATION_QUEUE_DEPTH (4)
+
+struct hailo_vdma_vctx;
+
 struct hailo_notification_wait {
     struct list_head    notification_wait_list;
     int                 tgid;
     struct file*        filp;
     struct completion 	notification_completion;
     spinlock_t          notification_lock;
-    struct hailo_d2h_notification notification;
+    struct hailo_d2h_notification notifications[HAILO_NOTIFICATION_QUEUE_DEPTH];
+    struct hailo_vdma_vctx *vctx;
     u64                 vctx_id;
-    bool                has_notification;
+    u16                 notification_read_index;
+    u16                 notification_write_index;
+    u16                 notification_count;
+    u32                 dropped_notifications;
     bool                is_disabled;
 };
 
