@@ -12,7 +12,7 @@ if [[ ! -e "${TRACE_PARAMETER}" ]]; then
     exit 1
 fi
 
-sudo -v
+sudo -n -v
 
 original_trace_value=$(<"${TRACE_PARAMETER}")
 
