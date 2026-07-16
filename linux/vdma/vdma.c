@@ -91,6 +91,7 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     atomic_set(&controller->total_ongoing_count, 0);
     atomic64_set(&controller->dispatched_vctx_id, 0);
     atomic64_set(&controller->dispatched_generation, 0);
+    atomic64_set(&controller->dispatch_epoch, 0);
     atomic64_set(&controller->notification_vctx_id, 0);
     mutex_init(&controller->dispatch_lock);
     spin_lock_init(&controller->interrupts_lock);
@@ -118,6 +119,7 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
             channel_context->logical_users = 0;
             channel_context->dispatch_sequence = 0;
             channel_context->last_dispatched_vctx_id = 0;
+            channel_context->owner_dispatch_epoch = 0;
             channel_context->enabled = false;
             channel_context->shutting_down = false;
         }

@@ -182,6 +182,7 @@ struct hailo_vdma_channel_context {
     u32 logical_users;
     u64 dispatch_sequence;
     u64 last_dispatched_vctx_id;
+    u64 owner_dispatch_epoch;
     bool enabled;
     bool shutting_down;
 };
@@ -214,6 +215,7 @@ struct hailo_vdma_controller {
     atomic_t total_ongoing_count;
     atomic64_t dispatched_vctx_id;
     atomic64_t dispatched_generation;
+    atomic64_t dispatch_epoch;
     atomic64_t notification_vctx_id;
 
     atomic_t registered_vctx_count;
