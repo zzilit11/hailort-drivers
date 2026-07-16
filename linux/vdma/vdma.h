@@ -217,6 +217,9 @@ struct hailo_vdma_controller {
     atomic64_t dispatched_generation;
     atomic64_t dispatch_epoch;
     atomic64_t notification_vctx_id;
+    unsigned long dispatch_started_jiffies;
+    atomic_t dispatch_commit_count;
+    atomic64_t dispatch_request_vctx_id;
 
     atomic_t registered_vctx_count;
 

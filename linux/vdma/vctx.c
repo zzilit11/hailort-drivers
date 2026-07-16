@@ -13,6 +13,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -31,6 +32,16 @@ static unsigned int vctx_stall_warn_ms = 5000;
 module_param_named(vctx_stall_warn_ms, vctx_stall_warn_ms, uint, 0644);
 MODULE_PARM_DESC(vctx_stall_warn_ms,
     "Report a committed VCTX transfer with no HW cursor progress for this many milliseconds (0 disables warnings; never aborts)");
+
+static unsigned int vctx_dispatch_quantum_ms = 50;
+module_param_named(vctx_dispatch_quantum_ms, vctx_dispatch_quantum_ms, uint, 0644);
+MODULE_PARM_DESC(vctx_dispatch_quantum_ms,
+    "Firmware VCTX ownership time threshold in milliseconds (0 disables this threshold)");
+
+static unsigned int vctx_dispatch_quantum_transfers = 64;
+module_param_named(vctx_dispatch_quantum_transfers, vctx_dispatch_quantum_transfers, uint, 0644);
+MODULE_PARM_DESC(vctx_dispatch_quantum_transfers,
+    "Firmware VCTX committed-transfer threshold (0 disables this threshold)");
 
 #define VCTX_TRACE(fmt, ...) \
     do { \
@@ -185,17 +196,146 @@ static bool vctx_uses_fw_dispatch(struct hailo_vdma_vctx *vctx)
     return resource_registered;
 }
 
+static bool vctx_dispatch_quantum_expired(struct hailo_vdma_controller *controller,
+    bool *time_expired, bool *transfer_expired)
+{
+    unsigned int quantum_ms = READ_ONCE(vctx_dispatch_quantum_ms);
+    unsigned int quantum_transfers = READ_ONCE(vctx_dispatch_quantum_transfers);
+    unsigned long started = READ_ONCE(controller->dispatch_started_jiffies);
+    int commit_count = atomic_read(&controller->dispatch_commit_count);
+
+    *time_expired = quantum_ms && time_after_eq(jiffies,
+        started + msecs_to_jiffies(quantum_ms));
+    *transfer_expired = quantum_transfers &&
+        commit_count >= (int)quantum_transfers;
+
+    /* Setting both parameters to zero intentionally restores the original
+     * immediate-switch policy for diagnostics and compatibility testing. */
+    return (!quantum_ms && !quantum_transfers) ||
+        *time_expired || *transfer_expired;
+}
+
+static unsigned long vctx_dispatch_wait_timeout(
+    struct hailo_vdma_vctx *vctx, struct hailo_vdma_controller *controller)
+{
+    unsigned int quantum_ms = READ_ONCE(vctx_dispatch_quantum_ms);
+    u64 dispatched_vctx_id;
+    unsigned long started;
+    unsigned long deadline;
+
+    if (!vctx_uses_fw_dispatch(vctx)) {
+        return MAX_SCHEDULE_TIMEOUT;
+    }
+    dispatched_vctx_id = atomic64_read(&controller->dispatched_vctx_id);
+    if (!quantum_ms || !dispatched_vctx_id ||
+        dispatched_vctx_id == vctx->vctx_id ||
+        atomic64_read(&controller->dispatch_request_vctx_id)) {
+        return MAX_SCHEDULE_TIMEOUT;
+    }
+
+    started = READ_ONCE(controller->dispatch_started_jiffies);
+    deadline = started + msecs_to_jiffies(quantum_ms);
+    if (time_after_eq(jiffies, deadline)) {
+        return 1;
+    }
+    return max_t(unsigned long, 1, deadline - jiffies);
+}
+
+static void vctx_dispatch_cancel_request(struct hailo_vdma_vctx *vctx)
+{
+    struct hailo_vdma_controller *controller = vctx->controller;
+
+    if ((u64)atomic64_cmpxchg(&controller->dispatch_request_vctx_id,
+            vctx->vctx_id, 0) == vctx->vctx_id) {
+        hailo_vdma_vctx_wake_all_admission(controller);
+    }
+}
+
 static bool vctx_device_dispatch_ready(struct hailo_vdma_vctx *vctx,
     struct hailo_vdma_controller *controller)
 {
     u64 dispatched_vctx_id;
+    u64 requested_vctx_id;
+    bool time_expired;
+    bool transfer_expired;
 
     if (!vctx_uses_fw_dispatch(vctx)) {
         return true;
     }
     dispatched_vctx_id = atomic64_read(&controller->dispatched_vctx_id);
-    return dispatched_vctx_id == vctx->vctx_id ||
+    if (!dispatched_vctx_id) {
+        return atomic_read(&controller->total_ongoing_count) == 0;
+    }
+
+    requested_vctx_id = atomic64_read(&controller->dispatch_request_vctx_id);
+    if (dispatched_vctx_id == vctx->vctx_id) {
+        /* Once a competitor has closed the quantum, do not admit more work
+         * for the old owner. Existing transfers are allowed to drain. */
+        return !requested_vctx_id || requested_vctx_id == vctx->vctx_id;
+    }
+
+    if (!vctx_dispatch_quantum_expired(controller,
+            &time_expired, &transfer_expired)) {
+        return false;
+    }
+
+    if (!requested_vctx_id) {
+        requested_vctx_id = atomic64_cmpxchg(
+            &controller->dispatch_request_vctx_id, 0, vctx->vctx_id);
+        if (!requested_vctx_id) {
+            requested_vctx_id = vctx->vctx_id;
+            VCTX_TRACE("VCTX_QUANTUM_REQUEST requester=%llu owner=%llu commits=%d age_ms=%u time_expired=%u transfer_expired=%u device_ongoing=%d\n",
+                (unsigned long long)vctx->vctx_id,
+                (unsigned long long)dispatched_vctx_id,
+                atomic_read(&controller->dispatch_commit_count),
+                jiffies_to_msecs(jiffies -
+                    READ_ONCE(controller->dispatch_started_jiffies)),
+                (unsigned int)time_expired,
+                (unsigned int)transfer_expired,
+                atomic_read(&controller->total_ongoing_count));
+        }
+    }
+
+    return requested_vctx_id == vctx->vctx_id &&
         atomic_read(&controller->total_ongoing_count) == 0;
+}
+
+/* admission_lock must be held.  A global FIFO would leave the active VCTX
+ * blocked behind the first competing transfer and collapse every quantum to
+ * one transfer.  Select the first queued transfer of the current quantum
+ * owner (or of the VCTX that requested the next quantum) instead. */
+static bool channel_admission_candidate_locked(
+    struct hailo_vdma_transfer *transfer,
+    struct hailo_vdma_channel_context *channel_context)
+{
+    struct hailo_vdma_controller *controller = transfer->vctx->controller;
+    struct hailo_vdma_transfer *queued;
+    u64 preferred_vctx_id;
+
+    if (list_empty(&channel_context->admission_queue)) {
+        return false;
+    }
+    if (!vctx_uses_fw_dispatch(transfer->vctx)) {
+        return list_first_entry(&channel_context->admission_queue,
+            struct hailo_vdma_transfer, admission_node) == transfer;
+    }
+
+    preferred_vctx_id = atomic64_read(&controller->dispatch_request_vctx_id);
+    if (!preferred_vctx_id) {
+        preferred_vctx_id = atomic64_read(&controller->dispatched_vctx_id);
+    }
+    if (!preferred_vctx_id) {
+        return list_first_entry(&channel_context->admission_queue,
+            struct hailo_vdma_transfer, admission_node) == transfer;
+    }
+
+    list_for_each_entry(queued, &channel_context->admission_queue,
+        admission_node) {
+        if (queued->vctx->vctx_id == preferred_vctx_id) {
+            return queued == transfer;
+        }
+    }
+    return false;
 }
 
 static bool channel_owner_fw_allows_release(struct hailo_vdma_channel_context *channel_context)
@@ -1148,11 +1288,10 @@ static bool admission_ready(struct hailo_vdma_transfer *transfer,
         !vctx_generation_is_active(transfer->vctx, transfer->generation) ||
         !vctx_channel_is_logically_enabled(transfer->vctx, transfer->engine_index,
             transfer->channel_index) || vctx_fw_is_terminal(transfer->vctx);
-    if (!ready && !list_empty(&channel_context->admission_queue) &&
-        list_first_entry(&channel_context->admission_queue,
-            struct hailo_vdma_transfer, admission_node) == transfer &&
-        !channel_context->shutting_down && vctx_fw_is_runnable(transfer->vctx) &&
+    if (!ready && !channel_context->shutting_down &&
+        vctx_fw_is_runnable(transfer->vctx) &&
         vctx_device_dispatch_ready(transfer->vctx, transfer->vctx->controller) &&
+        channel_admission_candidate_locked(transfer, channel_context) &&
         ((owner == transfer->vctx && channel_context->enabled &&
             channel_context->owner_generation == transfer->generation &&
             owner_dispatch_epoch == dispatch_epoch &&
@@ -1183,6 +1322,7 @@ static void cancel_waiting_transfer(struct hailo_vdma_transfer *transfer,
     transfer->status = -ECANCELED;
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     transfer_remove_from_vctx(transfer);
+    vctx_dispatch_cancel_request(transfer->vctx);
     wake_up_all(&channel_context->admission_wq);
     VCTX_TRACE("TRANSFER_CANCEL vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=wait\n",
         (unsigned long long)transfer->vctx->vctx_id,
@@ -1249,7 +1389,10 @@ static int dispatch_vctx_if_needed_locked(struct hailo_vdma_controller *controll
 {
     u64 dispatched_vctx_id;
     u64 dispatched_generation;
+    u64 requested_vctx_id;
     u64 dispatch_epoch;
+    unsigned int previous_age_ms;
+    int previous_commit_count;
     bool activated = false;
     int err = 0;
 
@@ -1259,7 +1402,18 @@ static int dispatch_vctx_if_needed_locked(struct hailo_vdma_controller *controll
 
     dispatched_vctx_id = atomic64_read(&controller->dispatched_vctx_id);
     dispatched_generation = atomic64_read(&controller->dispatched_generation);
+    requested_vctx_id = atomic64_read(&controller->dispatch_request_vctx_id);
     if (dispatched_vctx_id == vctx->vctx_id && dispatched_generation == vctx->generation) {
+        if (requested_vctx_id && requested_vctx_id != vctx->vctx_id) {
+            err = -EAGAIN;
+        }
+        goto exit;
+    }
+    /* When an owner exists, only the VCTX that closed its quantum may replace
+     * it.  This rechecks the lockless admission decision under dispatch_lock. */
+    if (dispatched_vctx_id && dispatched_vctx_id != vctx->vctx_id &&
+        requested_vctx_id != vctx->vctx_id) {
+        err = -EAGAIN;
         goto exit;
     }
     if (atomic_read(&controller->total_ongoing_count) != 0) {
@@ -1271,10 +1425,24 @@ static int dispatch_vctx_if_needed_locked(struct hailo_vdma_controller *controll
         goto exit;
     }
 
+    previous_commit_count = atomic_read(&controller->dispatch_commit_count);
+    previous_age_ms = dispatched_vctx_id ?
+        jiffies_to_msecs(jiffies -
+            READ_ONCE(controller->dispatch_started_jiffies)) : 0;
     err = controller->ops->activate_vctx(controller, vctx);
     if (!err) {
+        WRITE_ONCE(controller->dispatch_started_jiffies, jiffies);
+        atomic_set(&controller->dispatch_commit_count, 0);
+        atomic64_set(&controller->dispatch_request_vctx_id, 0);
         dispatch_epoch = atomic64_inc_return(&controller->dispatch_epoch);
         activated = true;
+        VCTX_TRACE("VCTX_QUANTUM_BEGIN vctx=%llu previous=%llu previous_commits=%d previous_age_ms=%u quantum_ms=%u quantum_transfers=%u dispatch_epoch=%llu\n",
+            (unsigned long long)vctx->vctx_id,
+            (unsigned long long)dispatched_vctx_id,
+            previous_commit_count, previous_age_ms,
+            READ_ONCE(vctx_dispatch_quantum_ms),
+            READ_ONCE(vctx_dispatch_quantum_transfers),
+            (unsigned long long)dispatch_epoch);
         VCTX_TRACE("DEVICE_SWITCH vctx=%llu gen=%llu dispatch_epoch=%llu\n",
             (unsigned long long)vctx->vctx_id,
             (unsigned long long)vctx->generation,
@@ -1365,6 +1533,8 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     unsigned long flags;
     u32 desc_count_mask;
     long err;
+    int quantum_commit_count = 0;
+    bool wake_quantum_waiters = false;
     u8 i;
 
     if (copy_from_user(&params, (void __user *)arg, sizeof(params))) {
@@ -1473,9 +1643,10 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
 
     for (;;) {
         up(board_mutex);
-        err = wait_event_interruptible(channel_context->admission_wq,
-            admission_ready(transfer, channel_context));
-        if (err) {
+        err = wait_event_interruptible_timeout(channel_context->admission_wq,
+            admission_ready(transfer, channel_context),
+            vctx_dispatch_wait_timeout(&context->vctx, controller));
+        if (err < 0) {
             *should_up_board_mutex = false;
             cancel_waiting_transfer(transfer, channel_context);
             return err;
@@ -1484,6 +1655,11 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             *should_up_board_mutex = false;
             cancel_waiting_transfer(transfer, channel_context);
             return -ERESTARTSYS;
+        }
+        /* A timeout is expected when a competing VCTX waits for the time
+         * quantum.  Re-evaluate admission while holding board_mutex again. */
+        if (!err) {
+            continue;
         }
 
         spin_lock_irqsave(&channel_context->admission_lock, flags);
@@ -1540,9 +1716,9 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             wake_up_all(&channel_context->admission_wq);
             return -ECANCELED;
         }
-        if (!list_empty(&channel_context->admission_queue) &&
-            list_first_entry(&channel_context->admission_queue,
-                struct hailo_vdma_transfer, admission_node) == transfer &&
+        if (vctx_fw_is_runnable(&context->vctx) &&
+            vctx_device_dispatch_ready(&context->vctx, controller) &&
+            channel_admission_candidate_locked(transfer, channel_context) &&
             ((channel_context->owner == &context->vctx && channel_context->enabled &&
                 channel_context->owner_generation == transfer->generation &&
                 channel_context->owner_dispatch_epoch ==
@@ -1557,8 +1733,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
                  (vctx_generation_is_active(channel_context->owner,
                     channel_context->owner_generation) &&
                   vctx_fw_allows_owner_release(channel_context->owner))))) &&
-            vctx_fw_is_runnable(&context->vctx) &&
-            vctx_device_dispatch_ready(&context->vctx, controller) &&
             atomic_read(&context->vctx.transfer_count) < context->vctx.transfer_quota) {
             transfer->state = HAILO_VDMA_TRANSFER_ADMITTED;
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
@@ -1685,13 +1859,22 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         transfer->cursor_progress_valid = true;
         atomic_inc(&channel_context->ongoing_count);
         atomic_inc(&controller->total_ongoing_count);
+        if (vctx_uses_fw_dispatch(&context->vctx) &&
+            atomic64_read(&controller->dispatched_vctx_id) ==
+                context->vctx.vctx_id) {
+            quantum_commit_count =
+                atomic_inc_return(&controller->dispatch_commit_count);
+            wake_quantum_waiters = READ_ONCE(vctx_dispatch_quantum_transfers) &&
+                quantum_commit_count ==
+                    (int)READ_ONCE(vctx_dispatch_quantum_transfers);
+        }
         atomic_inc(&context->vctx.transfer_count);
         transfer->quota_charged = true;
         spin_lock_irqsave(&context->vctx.lock, flags);
         list_del_init(&transfer->vctx_node);
         list_add_tail(&transfer->vctx_node, &context->vctx.ongoing_transfers);
         spin_unlock_irqrestore(&context->vctx.lock, flags);
-        VCTX_TRACE("TRANSFER_COMMIT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u logical_start=%u logical_last=%u descriptors=%u logical_ring_wrap=%u logical_avail=%u logical_proc=%u physical_start=%u physical_last=%u physical_ring_wrap=%u physical_avail=%u physical_proc=%u hw_avail=%u hw_proc=%u user_should_bind=%u forced_bind=1 ongoing=%d device_ongoing=%d quota=%d/%u\n",
+        VCTX_TRACE("TRANSFER_COMMIT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u logical_start=%u logical_last=%u descriptors=%u logical_ring_wrap=%u logical_avail=%u logical_proc=%u physical_start=%u physical_last=%u physical_ring_wrap=%u physical_avail=%u physical_proc=%u hw_avail=%u hw_proc=%u user_should_bind=%u forced_bind=1 ongoing=%d device_ongoing=%d quota=%d/%u quantum_commits=%d\n",
             (unsigned long long)transfer->vctx->vctx_id,
             (unsigned long long)transfer->generation,
             (unsigned long long)transfer->sequence,
@@ -1711,7 +1894,8 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             (unsigned int)params.should_bind,
             atomic_read(&channel_context->ongoing_count),
             atomic_read(&controller->total_ongoing_count),
-            atomic_read(&context->vctx.transfer_count), context->vctx.transfer_quota);
+            atomic_read(&context->vctx.transfer_count), context->vctx.transfer_quota,
+            quantum_commit_count);
     } else {
         transfer->status = err;
         transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
@@ -1726,6 +1910,9 @@ commit_done:
     mutex_unlock(&channel_context->lock);
     mutex_unlock(&controller->dispatch_lock);
     wake_up_all(&channel_context->admission_wq);
+    if (wake_quantum_waiters) {
+        hailo_vdma_vctx_wake_all_admission(controller);
+    }
 
     if (err < 0) {
         transfer_remove_from_vctx(transfer);
@@ -1995,6 +2182,7 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     context->vctx.cancel_requested = true;
     context->vctx.generation++;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    vctx_dispatch_cancel_request(&context->vctx);
     hailo_vdma_vctx_fw_state_changed(&context->vctx);
     VCTX_TRACE("VCTX_CLOSE_BEGIN vctx=%llu gen=%llu\n",
         (unsigned long long)context->vctx.vctx_id,
@@ -2067,6 +2255,9 @@ static void controller_abort_channels(struct hailo_vdma_controller *controller,
     atomic64_set(&controller->dispatched_generation, 0);
     atomic64_set(&controller->dispatch_epoch, 0);
     atomic64_set(&controller->notification_vctx_id, 0);
+    WRITE_ONCE(controller->dispatch_started_jiffies, jiffies);
+    atomic_set(&controller->dispatch_commit_count, 0);
+    atomic64_set(&controller->dispatch_request_vctx_id, 0);
     hailo_vdma_vctx_wake_all_admission(controller);
     VCTX_TRACE("CONTROLLER_ABORT_END permanent=%u\n", (unsigned int)permanently_stopped);
 }

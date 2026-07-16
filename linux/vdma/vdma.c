@@ -12,6 +12,7 @@
 #include "utils/logs.h"
 
 #include <linux/sched.h>
+#include <linux/jiffies.h>
 #include <linux/string.h>
 #include <linux/version.h>
 
@@ -93,6 +94,9 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     atomic64_set(&controller->dispatched_generation, 0);
     atomic64_set(&controller->dispatch_epoch, 0);
     atomic64_set(&controller->notification_vctx_id, 0);
+    controller->dispatch_started_jiffies = jiffies;
+    atomic_set(&controller->dispatch_commit_count, 0);
+    atomic64_set(&controller->dispatch_request_vctx_id, 0);
     mutex_init(&controller->dispatch_lock);
     spin_lock_init(&controller->interrupts_lock);
     init_waitqueue_head(&controller->interrupts_wq);
