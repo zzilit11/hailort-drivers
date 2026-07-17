@@ -334,7 +334,7 @@ long hailo_mark_as_in_use(struct hailo_vdma_file_context *context,
     bool newly_registered = false;
 
     spin_lock_irqsave(&context->vctx.lock, flags);
-    if (context->vctx.state != HAILO_VDMA_VCTX_ACTIVE || context->vctx.cancel_requested ||
+    if (context->vctx.state != HAILO_VDMA_VCTX_ACTIVE ||
         context->vctx.fw_state == HAILO_VDMA_VCTX_FW_ERROR) {
         params.in_use = true;
     } else if (!context->vctx.resource_registered) {

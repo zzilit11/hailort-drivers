@@ -49,18 +49,6 @@ MODULE_PARM_DESC(vctx_dispatch_quantum_transfers,
             pr_info("vctx-trace: " fmt, ##__VA_ARGS__); \
     } while (0)
 
-enum hailo_vdma_transfer_state {
-    HAILO_VDMA_TRANSFER_NEW = 0,
-    HAILO_VDMA_TRANSFER_WAITING,
-    HAILO_VDMA_TRANSFER_ADMITTED,
-    HAILO_VDMA_TRANSFER_COMMITTED,
-    HAILO_VDMA_TRANSFER_COMPLETING,
-    HAILO_VDMA_TRANSFER_COMPLETED,
-    HAILO_VDMA_TRANSFER_CANCELED,
-    HAILO_VDMA_TRANSFER_ABORTING,
-    HAILO_VDMA_TRANSFER_ABORTED,
-};
-
 struct hailo_vdma_transfer {
     struct list_head admission_node;
     struct list_head vctx_node;
@@ -68,7 +56,6 @@ struct hailo_vdma_transfer {
     struct hailo_vdma_vctx *vctx;
     struct hailo_descriptors_list_buffer *descriptors;
     struct hailo_vdma_mapped_transfer_buffer buffers[HAILO_MAX_BUFFERS_PER_SINGLE_TRANSFER];
-    enum hailo_vdma_transfer_state state;
     u64 sequence;
     u64 generation;
     u8 engine_index;
@@ -85,11 +72,8 @@ struct hailo_vdma_transfer {
     u32 physical_last_desc;
     unsigned long committed_jiffies;
     unsigned long cursor_progress_jiffies;
-    int status;
     u16 last_hw_num_proc;
     bool cancel_requested;
-    bool abort_requested;
-    bool event_delivered;
     bool resources_held;
     bool quota_charged;
     bool ring_wrapped;
@@ -116,7 +100,7 @@ static bool vctx_is_active(struct hailo_vdma_vctx *vctx)
     bool active;
 
     spin_lock_irqsave(&vctx->lock, flags);
-    active = (vctx->state == HAILO_VDMA_VCTX_ACTIVE) && !vctx->cancel_requested;
+    active = vctx->state == HAILO_VDMA_VCTX_ACTIVE;
     spin_unlock_irqrestore(&vctx->lock, flags);
     return active;
 }
@@ -127,7 +111,7 @@ static bool vctx_generation_is_active(struct hailo_vdma_vctx *vctx, u64 generati
     bool active;
 
     spin_lock_irqsave(&vctx->lock, flags);
-    active = (vctx->state == HAILO_VDMA_VCTX_ACTIVE) && !vctx->cancel_requested &&
+    active = (vctx->state == HAILO_VDMA_VCTX_ACTIVE) &&
         (vctx->generation == generation);
     spin_unlock_irqrestore(&vctx->lock, flags);
     return active;
@@ -140,7 +124,7 @@ static bool vctx_channel_is_logically_enabled(struct hailo_vdma_vctx *vctx,
     bool enabled;
 
     spin_lock_irqsave(&vctx->lock, flags);
-    enabled = (vctx->state == HAILO_VDMA_VCTX_ACTIVE) && !vctx->cancel_requested &&
+    enabled = (vctx->state == HAILO_VDMA_VCTX_ACTIVE) &&
         !!(vctx->logical_channels_bitmap[engine_index] & BIT(channel_index));
     spin_unlock_irqrestore(&vctx->lock, flags);
     return enabled;
@@ -426,8 +410,6 @@ static void transfer_drop_quota(struct hailo_vdma_transfer *transfer)
 {
     struct hailo_vdma_controller *controller;
     int new_count;
-    u8 engine_index;
-    u8 channel_index;
 
     if (!transfer->quota_charged) {
         return;
@@ -440,11 +422,7 @@ static void transfer_drop_quota(struct hailo_vdma_transfer *transfer)
     }
 
     controller = transfer->vctx->controller;
-    for (engine_index = 0; engine_index < controller->vdma_engines_count; engine_index++) {
-        for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
-            wake_up_all(&controller->channel_contexts[engine_index][channel_index].admission_wq);
-        }
-    }
+    hailo_vdma_vctx_wake_all_admission(controller);
 }
 
 static void transfer_destroy(struct hailo_vdma_transfer *transfer)
@@ -492,10 +470,6 @@ static void transfer_abort_callback(struct hailo_ongoing_transfer *ongoing, void
 
     channel_context = &transfer->vctx->controller->channel_contexts
         [transfer->engine_index][transfer->channel_index];
-    transfer->abort_requested = true;
-    transfer->state = HAILO_VDMA_TRANSFER_ABORTING;
-    transfer->status = -ECANCELED;
-    transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
     transfer_remove_from_vctx(transfer);
     transfer_finish_accounting(channel_context, transfer->vctx->controller);
     VCTX_TRACE("TRANSFER_ABORT vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d device_ongoing=%d\n",
@@ -503,7 +477,7 @@ static void transfer_abort_callback(struct hailo_ongoing_transfer *ongoing, void
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
         (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
-        transfer->status,
+        -ECANCELED,
         atomic_read(&transfer->vctx->controller->total_ongoing_count));
     transfer_destroy(transfer);
 }
@@ -531,7 +505,6 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
     vctx = transfer->vctx;
     channel_context = &vctx->controller->channel_contexts
         [transfer->engine_index][transfer->channel_index];
-    transfer->state = HAILO_VDMA_TRANSFER_COMPLETING;
     for (i = 0; i < transfer->buffers_count; i++) {
         struct hailo_vdma_buffer *buffer = transfer->buffers[i].opaque;
 
@@ -554,14 +527,9 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
             logical_state->num_proc = (u16)((transfer->last_desc + 1) &
                 logical_state->desc_count_mask);
         }
-        transfer->state = HAILO_VDMA_TRANSFER_COMPLETED;
-        transfer->status = 0;
         list_add_tail(&transfer->completed_node,
             &vctx->completed_transfers[transfer->engine_index][transfer->channel_index]);
         pending_count = ++vctx->events[transfer->engine_index][transfer->channel_index].completed_count;
-    } else {
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
-        transfer->status = -ECANCELED;
     }
     spin_unlock_irqrestore(&vctx->lock, flags);
 
@@ -576,7 +544,7 @@ static void transfer_complete_callback(struct hailo_ongoing_transfer *ongoing, v
         transfer->physical_starting_desc, transfer->physical_last_desc,
         (unsigned int)transfer->physical_ring_wrapped,
         jiffies_to_msecs(jiffies - transfer->committed_jiffies),
-        (unsigned int)publish, transfer->status, pending_count,
+        (unsigned int)publish, publish ? 0 : -ECANCELED, pending_count,
         atomic_read(&completion->controller->total_ongoing_count));
     transfer_release_resources(transfer);
     wake_up_all(&channel_context->admission_wq);
@@ -595,7 +563,6 @@ static void cancel_channel_admission(struct hailo_vdma_channel_context *channel_
     spin_lock_irqsave(&channel_context->admission_lock, flags);
     list_for_each_entry(transfer, &channel_context->admission_queue, admission_node) {
         transfer->cancel_requested = true;
-        transfer->state = HAILO_VDMA_TRANSFER_CANCELED;
     }
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     wake_up_all(&channel_context->admission_wq);
@@ -611,7 +578,6 @@ static void cancel_vctx_channel_admission(struct hailo_vdma_channel_context *cha
     list_for_each_entry(transfer, &channel_context->admission_queue, admission_node) {
         if (transfer->vctx == vctx) {
             transfer->cancel_requested = true;
-            transfer->state = HAILO_VDMA_TRANSFER_CANCELED;
         }
     }
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
@@ -619,7 +585,7 @@ static void cancel_vctx_channel_admission(struct hailo_vdma_channel_context *cha
 }
 
 static void purge_completed_channel(struct hailo_vdma_vctx *vctx, u8 engine_index,
-    u8 channel_index, bool delivered)
+    u8 channel_index)
 {
     struct hailo_vdma_transfer *transfer;
     struct hailo_vdma_transfer *next;
@@ -633,7 +599,6 @@ static void purge_completed_channel(struct hailo_vdma_vctx *vctx, u8 engine_inde
 
     list_for_each_entry_safe(transfer, next, &release_list, completed_node) {
         list_del_init(&transfer->completed_node);
-        transfer->event_delivered = delivered;
         transfer_destroy(transfer);
     }
 }
@@ -643,7 +608,7 @@ static void set_channel_terminal_event(struct hailo_vdma_vctx *vctx, u8 engine_i
 {
     unsigned long flags;
 
-    purge_completed_channel(vctx, engine_index, channel_index, true);
+    purge_completed_channel(vctx, engine_index, channel_index);
     spin_lock_irqsave(&vctx->lock, flags);
     if (data == HAILO_VDMA_TRANSFER_DATA_CHANNEL_WITH_ERROR) {
         vctx->events[engine_index][channel_index].channel_error = true;
@@ -662,7 +627,6 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
     struct hailo_vdma_engine *engine = &controller->vdma_engines[engine_index];
     struct hailo_vdma_channel *channel = &engine->channels[channel_index];
     struct hailo_vdma_vctx *previous_owner = channel_context->owner;
-    struct hailo_vdma_file_context *next_context;
     unsigned long flags;
     u64 previous_owner_id = previous_owner ? previous_owner->vctx_id : 0;
     u64 dispatch_epoch = atomic64_read(&controller->dispatch_epoch);
@@ -701,32 +665,6 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
         }
     }
 
-    if (previous_owner) {
-        struct hailo_vdma_channel_state previous_logical_state;
-        bool previous_state_valid;
-
-        /* channel->state is the currently programmed physical cursor.  The
-         * userspace-visible logical cursor is already kept in the VCTX and
-         * must never be overwritten with the physical value on a switch. */
-        spin_lock_irqsave(&previous_owner->lock, flags);
-        previous_logical_state =
-            previous_owner->channel_states[engine_index][channel_index];
-        previous_state_valid =
-            previous_owner->channel_state_valid[engine_index][channel_index];
-        spin_unlock_irqrestore(&previous_owner->lock, flags);
-        VCTX_TRACE("CHANNEL_CURSOR_SAVE vctx=%llu gen=%llu engine=%u channel=%u logical_valid=%u logical_avail=%u logical_proc=%u logical_mask=0x%x physical_avail=%u physical_proc=%u physical_mask=0x%x\n",
-            (unsigned long long)previous_owner->vctx_id,
-            (unsigned long long)channel_context->owner_generation,
-            (unsigned int)engine_index, (unsigned int)channel_index,
-            (unsigned int)previous_state_valid,
-            (unsigned int)previous_logical_state.num_avail,
-            (unsigned int)previous_logical_state.num_proc,
-            previous_logical_state.desc_count_mask,
-            (unsigned int)channel->state.num_avail,
-            (unsigned int)channel->state.num_proc,
-            channel->state.desc_count_mask);
-    }
-
     if (channel_context->enabled) {
         hailo_vdma_engine_disable_channels_with_callback(engine, channel_bit, NULL, NULL);
     }
@@ -739,7 +677,6 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
     hailo_vdma_engine_clear_channel_interrupts(engine, channel_bit);
     spin_unlock_irqrestore(&controller->interrupts_lock, flags);
 
-    next_context = container_of(next_owner, struct hailo_vdma_file_context, vctx);
     hailo_vdma_vctx_get(next_owner);
     channel_context->owner = next_owner;
     channel_context->owner_generation = next_owner->generation;
@@ -747,8 +684,6 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
         vctx_get_fw_state(next_owner, &channel_context->owner_resource_registered);
     channel_context->owner_active = true;
     channel_context->enabled = true;
-    channel_context->dispatch_sequence++;
-    channel_context->last_dispatched_vctx_id = next_owner->vctx_id;
     channel_context->owner_dispatch_epoch = dispatch_epoch;
     hailo_vdma_engine_enable_channels(engine, channel_bit,
         next_owner->enable_timestamps_measure);
@@ -786,8 +721,6 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
     hw_num_avail_after = hailo_vdma_get_num_avail(channel->host_regs);
     channel->state.num_avail = hw_num_proc_after;
     channel->state.num_proc = hw_num_proc_after;
-    next_context->enabled_channels_bitmap[engine_index] |= channel_bit;
-
     if (previous_owner) {
         hailo_vdma_vctx_put(previous_owner);
     }
@@ -809,13 +742,12 @@ static int bind_channel_to_vctx_locked(struct hailo_vdma_controller *controller,
         (unsigned int)hw_num_avail_after,
         (unsigned int)hw_num_proc_after,
         (unsigned int)(hw_num_avail_after != hw_num_proc_after));
-    VCTX_TRACE("CHANNEL_SWITCH from=%llu to=%llu gen=%llu dispatch_epoch=%llu engine=%u channel=%u dispatch=%llu physical_avail=%u physical_proc=%u physical_mask=0x%x\n",
+    VCTX_TRACE("CHANNEL_SWITCH from=%llu to=%llu gen=%llu dispatch_epoch=%llu engine=%u channel=%u physical_avail=%u physical_proc=%u physical_mask=0x%x\n",
         (unsigned long long)previous_owner_id,
         (unsigned long long)next_owner->vctx_id,
         (unsigned long long)next_owner->generation,
         (unsigned long long)dispatch_epoch,
         (unsigned int)engine_index, (unsigned int)channel_index,
-        (unsigned long long)channel_context->dispatch_sequence,
         (unsigned int)channel->state.num_avail,
         (unsigned int)channel->state.num_proc,
         channel->state.desc_count_mask);
@@ -833,10 +765,8 @@ static void disable_vctx_channel(struct hailo_vdma_controller *controller,
     struct hailo_vdma_vctx *released_owner = NULL;
     unsigned long flags;
     u32 channel_bit = BIT(channel_index);
-    bool was_logically_enabled;
 
     spin_lock_irqsave(&vctx->lock, flags);
-    was_logically_enabled = !!(vctx->logical_channels_bitmap[engine_index] & channel_bit);
     vctx->logical_channels_bitmap[engine_index] &= ~channel_bit;
     vctx->channel_states[engine_index][channel_index].num_avail = 0;
     vctx->channel_states[engine_index][channel_index].num_proc = 0;
@@ -844,13 +774,8 @@ static void disable_vctx_channel(struct hailo_vdma_controller *controller,
     vctx->channel_state_valid[engine_index][channel_index] = false;
     vctx->events[engine_index][channel_index].disable_wakeup = notify_waiter;
     spin_unlock_irqrestore(&vctx->lock, flags);
-    context->enabled_channels_bitmap[engine_index] &= ~channel_bit;
-
     cancel_vctx_channel_admission(channel_context, vctx);
     mutex_lock(&channel_context->lock);
-    if (was_logically_enabled && channel_context->logical_users > 0) {
-        channel_context->logical_users--;
-    }
     if (channel_context->owner == vctx) {
         channel_context->shutting_down = true;
         if (channel_context->enabled) {
@@ -882,7 +807,7 @@ static void disable_vctx_channel(struct hailo_vdma_controller *controller,
     }
     mutex_unlock(&channel_context->lock);
 
-    purge_completed_channel(vctx, engine_index, channel_index, true);
+    purge_completed_channel(vctx, engine_index, channel_index);
     if (released_owner) {
         hailo_vdma_vctx_put(released_owner);
     }
@@ -890,11 +815,11 @@ static void disable_vctx_channel(struct hailo_vdma_controller *controller,
         wake_up_interruptible_all(&vctx->events_wq);
     }
     wake_up_all(&channel_context->admission_wq);
-    VCTX_TRACE("CHANNEL_LOGICAL_DISABLE vctx=%llu gen=%llu engine=%u channel=%u users=%u notify=%u\n",
+    VCTX_TRACE("CHANNEL_LOGICAL_DISABLE vctx=%llu gen=%llu engine=%u channel=%u notify=%u\n",
         (unsigned long long)vctx->vctx_id,
         (unsigned long long)vctx->generation,
         (unsigned int)engine_index, (unsigned int)channel_index,
-        channel_context->logical_users, (unsigned int)notify_waiter);
+        (unsigned int)notify_waiter);
 }
 
 long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
@@ -923,8 +848,6 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
             struct hailo_vdma_channel_context *channel_context =
                 &controller->channel_contexts[engine_index][channel_index];
             u32 channel_bit = BIT(channel_index);
-            bool newly_enabled;
-            u32 logical_users;
             u64 physical_owner_id;
 
             if (!(bitmap & channel_bit)) {
@@ -932,18 +855,12 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
             }
 
             spin_lock_irqsave(&context->vctx.lock, flags);
-            newly_enabled = !(context->vctx.logical_channels_bitmap[engine_index] & channel_bit);
             context->vctx.logical_channels_bitmap[engine_index] |= channel_bit;
             context->vctx.events[engine_index][channel_index].channel_error = false;
             context->vctx.events[engine_index][channel_index].channel_inactive = false;
             context->vctx.events[engine_index][channel_index].disable_wakeup = false;
             spin_unlock_irqrestore(&context->vctx.lock, flags);
-            context->enabled_channels_bitmap[engine_index] |= channel_bit;
-
             mutex_lock(&channel_context->lock);
-            if (newly_enabled) {
-                channel_context->logical_users++;
-            }
             if (!channel_context->owner) {
                 bind_channel_to_vctx_locked(controller, engine_index, channel_index,
                     &context->vctx);
@@ -951,15 +868,13 @@ long hailo_vdma_vctx_enable_channels(struct hailo_vdma_controller *controller,
                 hailo_vdma_engine_enable_channels(&controller->vdma_engines[engine_index],
                     channel_bit, input.enable_timestamps_measure);
             }
-            logical_users = channel_context->logical_users;
             physical_owner_id = channel_context->owner ?
                 channel_context->owner->vctx_id : 0;
             mutex_unlock(&channel_context->lock);
-            VCTX_TRACE("CHANNEL_LOGICAL_ENABLE vctx=%llu gen=%llu engine=%u channel=%u users=%u physical_owner=%llu timestamps=%u\n",
+            VCTX_TRACE("CHANNEL_LOGICAL_ENABLE vctx=%llu gen=%llu engine=%u channel=%u physical_owner=%llu timestamps=%u\n",
                 (unsigned long long)context->vctx.vctx_id,
                 (unsigned long long)context->vctx.generation,
                 (unsigned int)engine_index, (unsigned int)channel_index,
-                logical_users,
                 (unsigned long long)physical_owner_id,
                 (unsigned int)input.enable_timestamps_measure);
         }
@@ -1047,7 +962,6 @@ static void consume_completed(struct hailo_vdma_vctx *vctx, u8 engine_index,
 
     list_for_each_entry_safe(transfer, next, &release_list, completed_node) {
         list_del_init(&transfer->completed_node);
-        transfer->event_delivered = true;
         transfer_destroy(transfer);
     }
 }
@@ -1284,7 +1198,7 @@ static bool admission_ready(struct hailo_vdma_transfer *transfer,
     owner = READ_ONCE(channel_context->owner);
     owner_dispatch_epoch = READ_ONCE(channel_context->owner_dispatch_epoch);
     dispatch_epoch = atomic64_read(&transfer->vctx->controller->dispatch_epoch);
-    ready = transfer->cancel_requested || transfer->abort_requested ||
+    ready = transfer->cancel_requested ||
         !vctx_generation_is_active(transfer->vctx, transfer->generation) ||
         !vctx_channel_is_logically_enabled(transfer->vctx, transfer->engine_index,
             transfer->channel_index) || vctx_fw_is_terminal(transfer->vctx);
@@ -1318,8 +1232,6 @@ static void cancel_waiting_transfer(struct hailo_vdma_transfer *transfer,
         list_del_init(&transfer->admission_node);
     }
     transfer->cancel_requested = true;
-    transfer->state = HAILO_VDMA_TRANSFER_CANCELED;
-    transfer->status = -ECANCELED;
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     transfer_remove_from_vctx(transfer);
     vctx_dispatch_cancel_request(transfer->vctx);
@@ -1329,7 +1241,7 @@ static void cancel_waiting_transfer(struct hailo_vdma_transfer *transfer,
         (unsigned long long)transfer->generation,
         (unsigned long long)transfer->sequence,
         (unsigned int)transfer->engine_index, (unsigned int)transfer->channel_index,
-        transfer->status);
+        -ECANCELED);
     transfer_destroy(transfer);
 }
 
@@ -1586,7 +1498,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     transfer->generation = context->vctx.generation;
     transfer->starting_desc = params.starting_desc;
     transfer->sequence = atomic64_inc_return(&context->vctx.next_transfer_sequence);
-    transfer->state = HAILO_VDMA_TRANSFER_NEW;
     hailo_vdma_vctx_get(&context->vctx);
 
     err = transfer_acquire_resources(transfer, context, controller, &params);
@@ -1627,7 +1538,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         transfer_destroy(transfer);
         return -ECANCELED;
     }
-    transfer->state = HAILO_VDMA_TRANSFER_WAITING;
     list_add_tail(&transfer->admission_node, &channel_context->admission_queue);
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     spin_lock_irqsave(&context->vctx.lock, flags);
@@ -1663,7 +1573,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         }
 
         spin_lock_irqsave(&channel_context->admission_lock, flags);
-        if (transfer->cancel_requested || transfer->abort_requested ||
+        if (transfer->cancel_requested ||
             !vctx_generation_is_active(&context->vctx, transfer->generation) ||
             !vctx_channel_is_logically_enabled(&context->vctx,
                 params.engine_index, params.channel_index) ||
@@ -1734,7 +1644,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
                     channel_context->owner_generation) &&
                   vctx_fw_allows_owner_release(channel_context->owner))))) &&
             atomic_read(&context->vctx.transfer_count) < context->vctx.transfer_quota) {
-            transfer->state = HAILO_VDMA_TRANSFER_ADMITTED;
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             if (channel_context->owner != &context->vctx || !channel_context->enabled ||
                 channel_context->owner_generation != transfer->generation ||
@@ -1744,7 +1653,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
                     params.channel_index, &context->vctx);
                 if (err) {
                     if (err == -EAGAIN) {
-                        transfer->state = HAILO_VDMA_TRANSFER_WAITING;
                         mutex_unlock(&channel_context->lock);
                         mutex_unlock(&controller->dispatch_lock);
                         continue;
@@ -1757,8 +1665,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
                     mutex_unlock(&channel_context->lock);
                     mutex_unlock(&controller->dispatch_lock);
                     transfer_remove_from_vctx(transfer);
-                    transfer->status = err;
-                    transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
                     transfer_destroy(transfer);
                     wake_up_all(&channel_context->admission_wq);
                     return err;
@@ -1783,8 +1689,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         channel_context->bound_descriptors = transfer->descriptors;
     } else if (channel_context->bound_descriptors != transfer->descriptors) {
         err = -EINVAL;
-        transfer->status = err;
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
         goto commit_done;
     }
 
@@ -1797,8 +1701,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
 
     if (!vctx_fw_is_runnable(&context->vctx)) {
         err = -EAGAIN;
-        transfer->status = err;
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
         goto commit_done;
     }
 
@@ -1814,15 +1716,11 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             (unsigned int)transfer->engine_index,
             (unsigned int)transfer->channel_index,
             transfer->starting_desc, err);
-        transfer->status = err;
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
         goto commit_done;
     }
     err = prepare_physical_channel_cursor(channel, desc_count_mask,
         &transfer->physical_starting_desc);
     if (err) {
-        transfer->status = err;
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
         goto commit_done;
     }
 
@@ -1836,7 +1734,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         params.first_interrupts_domain, params.last_interrupts_domain,
         params.is_debug, transfer);
     if (err >= 0) {
-        transfer->state = HAILO_VDMA_TRANSFER_COMMITTED;
         transfer->programmed_descs = err;
         transfer->last_desc = (u32)(((u64)transfer->starting_desc +
             transfer->programmed_descs - 1) % transfer->descriptors->desc_list.desc_count);
@@ -1896,9 +1793,6 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             atomic_read(&controller->total_ongoing_count),
             atomic_read(&context->vctx.transfer_count), context->vctx.transfer_quota,
             quantum_commit_count);
-    } else {
-        transfer->status = err;
-        transfer->state = HAILO_VDMA_TRANSFER_ABORTED;
     }
 
 commit_done:
@@ -2062,8 +1956,7 @@ static void hailo_vdma_vctx_stall_monitor_work(struct work_struct *work)
                 ongoing = &channel->ongoing_transfers.transfers[
                     channel->ongoing_transfers.tail];
                 transfer = ongoing->opaque;
-                if (!transfer ||
-                    transfer->state != HAILO_VDMA_TRANSFER_COMMITTED) {
+                if (!transfer) {
                     mutex_unlock(&channel_context->lock);
                     continue;
                 }
@@ -2179,7 +2072,6 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
         return;
     }
     context->vctx.state = HAILO_VDMA_VCTX_CLOSING;
-    context->vctx.cancel_requested = true;
     context->vctx.generation++;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
     vctx_dispatch_cancel_request(&context->vctx);
@@ -2193,7 +2085,7 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
 
     for (engine_index = 0; engine_index < MAX_VDMA_ENGINES; engine_index++) {
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
-            purge_completed_channel(&context->vctx, engine_index, channel_index, false);
+            purge_completed_channel(&context->vctx, engine_index, channel_index);
         }
     }
     spin_lock_irqsave(&context->vctx.lock, flags);

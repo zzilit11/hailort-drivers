@@ -120,9 +120,6 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
             channel_context->owner_active = false;
             channel_context->bound_descriptors = NULL;
             atomic_set(&channel_context->ongoing_count, 0);
-            channel_context->logical_users = 0;
-            channel_context->dispatch_sequence = 0;
-            channel_context->last_dispatched_vctx_id = 0;
             channel_context->owner_dispatch_epoch = 0;
             channel_context->enabled = false;
             channel_context->shutting_down = false;
@@ -173,11 +170,9 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     atomic_set(&context->vctx.transfer_count, 0);
     context->vctx.transfer_quota = controller->vdma_engines_count *
         MAX_VDMA_CHANNELS_PER_ENGINE * (HAILO_VDMA_MAX_ONGOING_TRANSFERS - 1);
-    context->vctx.cancel_requested = false;
     context->vctx.resource_registered = false;
     context->vctx.enable_timestamps_measure = false;
     context->vctx.fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
-    context->vctx.fw_epoch = 0;
     context->vctx.application_count = 0;
     memset(context->vctx.application_map, 0xff, sizeof(context->vctx.application_map));
     context->vctx.activation_valid = false;
@@ -188,7 +183,6 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     INIT_LIST_HEAD(&context->vctx.queued_transfers);
     INIT_LIST_HEAD(&context->vctx.ongoing_transfers);
     for (engine_index = 0; engine_index < MAX_VDMA_ENGINES; engine_index++) {
-        context->enabled_channels_bitmap[engine_index] = 0;
         context->vctx.logical_channels_bitmap[engine_index] = 0;
         for (channel_index = 0; channel_index < MAX_VDMA_CHANNELS_PER_ENGINE; channel_index++) {
             context->vctx.channel_states[engine_index][channel_index].num_avail = 0;
@@ -207,7 +201,8 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     INIT_LIST_HEAD(&context->vdma_low_memory_buffer_list);
     INIT_LIST_HEAD(&context->continuous_buffer_list);
 
-    BUILD_BUG_ON_MSG(MAX_VDMA_CHANNELS_PER_ENGINE > sizeof(context->enabled_channels_bitmap[0]) * BITS_IN_BYTE,
+    BUILD_BUG_ON_MSG(MAX_VDMA_CHANNELS_PER_ENGINE >
+        sizeof(context->vctx.logical_channels_bitmap[0]) * BITS_IN_BYTE,
         "Unexpected amount of VDMA channels per engine");
 
     hailo_vdma_vctx_trace_created(&context->vctx);

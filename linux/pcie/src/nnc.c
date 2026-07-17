@@ -108,7 +108,6 @@ static void hailo_fw_vctx_set_state(struct hailo_vdma_vctx *vctx,
 
     spin_lock_irqsave(&vctx->lock, flags);
     vctx->fw_state = state;
-    vctx->fw_epoch++;
     spin_unlock_irqrestore(&vctx->lock, flags);
     hailo_vdma_vctx_fw_state_changed(vctx);
 }
@@ -151,7 +150,6 @@ static void hailo_fw_vctx_clear_applications(struct hailo_vdma_vctx *vctx)
     vctx->activation_valid = false;
     vctx->activation_request_len = 0;
     vctx->fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
-    vctx->fw_epoch++;
     spin_unlock_irqrestore(&vctx->lock, flags);
     hailo_vdma_vctx_fw_state_changed(vctx);
 }
@@ -492,7 +490,6 @@ static void hailo_fw_vctx_complete(struct hailo_file_context *context,
                 fw_control->pending_global_application;
             vctx->application_count++;
             vctx->fw_state = HAILO_VDMA_VCTX_FW_CONFIGURED;
-            vctx->fw_epoch++;
             spin_unlock_irqrestore(&vctx->lock, flags);
             hailo_vdma_vctx_fw_state_changed(vctx);
             hailo_notice(board,
@@ -669,7 +666,6 @@ void hailo_nnc_reset_virtualization_state(struct hailo_pcie_board *board)
 
         spin_lock_irqsave(&vctx->lock, flags);
         vctx->fw_state = HAILO_VDMA_VCTX_FW_UNCONFIGURED;
-        vctx->fw_epoch++;
         vctx->application_count = 0;
         memset(vctx->application_map, 0xff, sizeof(vctx->application_map));
         vctx->activation_valid = false;

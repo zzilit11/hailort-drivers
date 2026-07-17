@@ -147,11 +147,9 @@ struct hailo_vdma_vctx {
     atomic64_t next_transfer_sequence;
     atomic_t transfer_count;
     u32 transfer_quota;
-    bool cancel_requested;
     bool resource_registered;
     bool enable_timestamps_measure;
     enum hailo_vdma_vctx_fw_state fw_state;
-    u64 fw_epoch;
     u32 logical_channels_bitmap[MAX_VDMA_ENGINES];
     struct hailo_vdma_channel_state channel_states[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
     bool channel_state_valid[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
@@ -179,9 +177,6 @@ struct hailo_vdma_channel_context {
     bool owner_active;
     struct hailo_descriptors_list_buffer *bound_descriptors;
     atomic_t ongoing_count;
-    u32 logical_users;
-    u64 dispatch_sequence;
-    u64 last_dispatched_vctx_id;
     u64 owner_dispatch_epoch;
     bool enabled;
     bool shutting_down;
@@ -242,7 +237,6 @@ struct hailo_vdma_file_context {
     struct list_head descriptors_buffer_list;
     struct list_head vdma_low_memory_buffer_list;
     struct list_head continuous_buffer_list;
-    u32 enabled_channels_bitmap[MAX_VDMA_ENGINES];
 };
 
 
