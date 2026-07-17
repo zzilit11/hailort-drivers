@@ -82,6 +82,14 @@ struct hailo_vdma_transfer {
     bool stall_reported;
 };
 
+struct hailo_vdma_vctx_admission_snapshot {
+    u64 generation;
+    enum hailo_vdma_vctx_state state;
+    enum hailo_vdma_vctx_fw_state fw_state;
+    bool resource_registered;
+    bool channel_enabled;
+};
+
 struct hailo_vdma_completion_context {
     struct hailo_vdma_controller *controller;
     bool publish_event;
@@ -92,6 +100,54 @@ void hailo_vdma_vctx_trace_created(struct hailo_vdma_vctx *vctx)
     VCTX_TRACE("VCTX_CREATE vctx=%llu gen=%llu quota=%u\n",
         (unsigned long long)vctx->vctx_id,
         (unsigned long long)vctx->generation, vctx->transfer_quota);
+}
+
+static void vctx_get_admission_snapshot(struct hailo_vdma_vctx *vctx,
+    u8 engine_index, u8 channel_index,
+    struct hailo_vdma_vctx_admission_snapshot *snapshot)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&vctx->lock, flags);
+    snapshot->generation = vctx->generation;
+    snapshot->state = vctx->state;
+    snapshot->fw_state = vctx->fw_state;
+    snapshot->resource_registered = vctx->resource_registered;
+    snapshot->channel_enabled =
+        !!(vctx->logical_channels_bitmap[engine_index] & BIT(channel_index));
+    spin_unlock_irqrestore(&vctx->lock, flags);
+}
+
+static bool vctx_admission_snapshot_fw_runnable(
+    const struct hailo_vdma_vctx_admission_snapshot *snapshot)
+{
+    return !snapshot->resource_registered ||
+        snapshot->fw_state == HAILO_VDMA_VCTX_FW_RUNNABLE;
+}
+
+static bool vctx_admission_snapshot_fw_terminal(
+    const struct hailo_vdma_vctx_admission_snapshot *snapshot)
+{
+    return snapshot->resource_registered &&
+        snapshot->fw_state == HAILO_VDMA_VCTX_FW_ERROR;
+}
+
+static bool vctx_admission_snapshot_channel_enabled(
+    const struct hailo_vdma_vctx_admission_snapshot *snapshot)
+{
+    return snapshot->state == HAILO_VDMA_VCTX_ACTIVE &&
+        snapshot->channel_enabled;
+}
+
+static bool transfer_admission_is_canceled(
+    const struct hailo_vdma_transfer *transfer,
+    const struct hailo_vdma_vctx_admission_snapshot *snapshot)
+{
+    return transfer->cancel_requested ||
+        snapshot->state != HAILO_VDMA_VCTX_ACTIVE ||
+        snapshot->generation != transfer->generation ||
+        !snapshot->channel_enabled ||
+        vctx_admission_snapshot_fw_terminal(snapshot);
 }
 
 static bool vctx_is_active(struct hailo_vdma_vctx *vctx)
@@ -152,15 +208,6 @@ static bool vctx_fw_is_runnable(struct hailo_vdma_vctx *vctx)
     /* Non-NNC users do not call HAILO_MARK_AS_IN_USE and keep the legacy
      * VDMA-only path. Registered NNC VCTXs must complete FW configuration. */
     return !resource_registered || state == HAILO_VDMA_VCTX_FW_RUNNABLE;
-}
-
-static bool vctx_fw_is_terminal(struct hailo_vdma_vctx *vctx)
-{
-    bool resource_registered;
-    enum hailo_vdma_vctx_fw_state state =
-        vctx_get_fw_state(vctx, &resource_registered);
-
-    return resource_registered && state == HAILO_VDMA_VCTX_FW_ERROR;
 }
 
 static bool vctx_fw_allows_owner_release(struct hailo_vdma_vctx *vctx)
@@ -236,14 +283,14 @@ static void vctx_dispatch_cancel_request(struct hailo_vdma_vctx *vctx)
 }
 
 static bool vctx_device_dispatch_ready(struct hailo_vdma_vctx *vctx,
-    struct hailo_vdma_controller *controller)
+    struct hailo_vdma_controller *controller, bool uses_fw_dispatch)
 {
     u64 dispatched_vctx_id;
     u64 requested_vctx_id;
     bool time_expired;
     bool transfer_expired;
 
-    if (!vctx_uses_fw_dispatch(vctx)) {
+    if (!uses_fw_dispatch) {
         return true;
     }
     dispatched_vctx_id = atomic64_read(&controller->dispatched_vctx_id);
@@ -290,7 +337,8 @@ static bool vctx_device_dispatch_ready(struct hailo_vdma_vctx *vctx,
  * owner (or of the VCTX that requested the next quantum) instead. */
 static bool channel_admission_candidate_locked(
     struct hailo_vdma_transfer *transfer,
-    struct hailo_vdma_channel_context *channel_context)
+    struct hailo_vdma_channel_context *channel_context,
+    bool uses_fw_dispatch)
 {
     struct hailo_vdma_controller *controller = transfer->vctx->controller;
     struct hailo_vdma_transfer *queued;
@@ -299,7 +347,7 @@ static bool channel_admission_candidate_locked(
     if (list_empty(&channel_context->admission_queue)) {
         return false;
     }
-    if (!vctx_uses_fw_dispatch(transfer->vctx)) {
+    if (!uses_fw_dispatch) {
         return list_first_entry(&channel_context->admission_queue,
             struct hailo_vdma_transfer, admission_node) == transfer;
     }
@@ -328,6 +376,28 @@ static bool channel_owner_fw_allows_release(struct hailo_vdma_channel_context *c
 
     return !READ_ONCE(channel_context->owner_resource_registered) ||
         state != HAILO_VDMA_VCTX_FW_CONFIGURING;
+}
+
+static bool channel_has_admission_capacity(
+    const struct hailo_vdma_transfer *transfer,
+    struct hailo_vdma_channel_context *channel_context,
+    struct hailo_vdma_vctx *owner, u64 owner_dispatch_epoch,
+    u64 dispatch_epoch, bool owner_releasable)
+{
+    int ongoing_count = atomic_read(&channel_context->ongoing_count);
+
+    if (owner == transfer->vctx && READ_ONCE(channel_context->enabled) &&
+        READ_ONCE(channel_context->owner_generation) == transfer->generation &&
+        owner_dispatch_epoch == dispatch_epoch) {
+        return ongoing_count < HAILO_VDMA_CHANNEL_TRANSFER_CAPACITY;
+    }
+
+    if ((owner != transfer->vctx || owner_dispatch_epoch != dispatch_epoch) &&
+        ongoing_count == 0) {
+        return !owner || owner == transfer->vctx || owner_releasable;
+    }
+
+    return false;
 }
 
 void hailo_vdma_vctx_fw_state_changed(struct hailo_vdma_vctx *vctx)
@@ -1188,33 +1258,34 @@ restore_events:
 static bool admission_ready(struct hailo_vdma_transfer *transfer,
     struct hailo_vdma_channel_context *channel_context)
 {
+    struct hailo_vdma_vctx_admission_snapshot snapshot;
     struct hailo_vdma_vctx *owner;
     u64 owner_dispatch_epoch;
     u64 dispatch_epoch;
     unsigned long flags;
+    bool admission_policy_ready;
+    bool owner_releasable;
     bool ready;
 
     spin_lock_irqsave(&channel_context->admission_lock, flags);
     owner = READ_ONCE(channel_context->owner);
     owner_dispatch_epoch = READ_ONCE(channel_context->owner_dispatch_epoch);
     dispatch_epoch = atomic64_read(&transfer->vctx->controller->dispatch_epoch);
-    ready = transfer->cancel_requested ||
-        !vctx_generation_is_active(transfer->vctx, transfer->generation) ||
-        !vctx_channel_is_logically_enabled(transfer->vctx, transfer->engine_index,
-            transfer->channel_index) || vctx_fw_is_terminal(transfer->vctx);
-    if (!ready && !channel_context->shutting_down &&
-        vctx_fw_is_runnable(transfer->vctx) &&
-        vctx_device_dispatch_ready(transfer->vctx, transfer->vctx->controller) &&
-        channel_admission_candidate_locked(transfer, channel_context) &&
-        ((owner == transfer->vctx && channel_context->enabled &&
-            channel_context->owner_generation == transfer->generation &&
-            owner_dispatch_epoch == dispatch_epoch &&
-            atomic_read(&channel_context->ongoing_count) < HAILO_VDMA_CHANNEL_TRANSFER_CAPACITY) ||
-         ((owner != transfer->vctx || owner_dispatch_epoch != dispatch_epoch) &&
-            atomic_read(&channel_context->ongoing_count) == 0 &&
-            (!owner || owner == transfer->vctx ||
-                (READ_ONCE(channel_context->owner_active) &&
-                 channel_owner_fw_allows_release(channel_context))))) &&
+    vctx_get_admission_snapshot(transfer->vctx, transfer->engine_index,
+        transfer->channel_index, &snapshot);
+    ready = transfer_admission_is_canceled(transfer, &snapshot);
+    admission_policy_ready = !ready && !channel_context->shutting_down &&
+        vctx_admission_snapshot_fw_runnable(&snapshot) &&
+        vctx_device_dispatch_ready(transfer->vctx,
+            transfer->vctx->controller, snapshot.resource_registered) &&
+        channel_admission_candidate_locked(transfer, channel_context,
+            snapshot.resource_registered);
+    owner_releasable = admission_policy_ready && owner &&
+        owner != transfer->vctx && READ_ONCE(channel_context->owner_active) &&
+        channel_owner_fw_allows_release(channel_context);
+    if (admission_policy_ready &&
+        channel_has_admission_capacity(transfer, channel_context, owner,
+            owner_dispatch_epoch, dispatch_epoch, owner_releasable) &&
         atomic_read(&transfer->vctx->transfer_count) < transfer->vctx->transfer_quota) {
         ready = true;
     }
@@ -1439,13 +1510,18 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     struct semaphore *board_mutex, bool *should_up_board_mutex)
 {
     struct hailo_vdma_launch_transfer_params params;
+    struct hailo_vdma_vctx_admission_snapshot vctx_snapshot;
     struct hailo_vdma_transfer *transfer;
     struct hailo_vdma_channel_context *channel_context;
     struct hailo_vdma_channel *channel;
+    struct hailo_vdma_vctx *physical_owner;
     unsigned long flags;
+    u64 dispatch_epoch;
     u32 desc_count_mask;
     long err;
     int quantum_commit_count = 0;
+    bool admission_policy_ready;
+    bool owner_releasable;
     bool wake_quantum_waiters = false;
     u8 i;
 
@@ -1465,7 +1541,9 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             return -EINVAL;
         }
     }
-    if (!vctx_fw_is_runnable(&context->vctx)) {
+    vctx_get_admission_snapshot(&context->vctx, params.engine_index,
+        params.channel_index, &vctx_snapshot);
+    if (!vctx_admission_snapshot_fw_runnable(&vctx_snapshot)) {
         VCTX_TRACE("TRANSFER_DENY requester=%llu gen=%llu engine=%u channel=%u status=%d stage=firmware-state\n",
             (unsigned long long)context->vctx.vctx_id,
             (unsigned long long)context->vctx.generation,
@@ -1475,8 +1553,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     }
 
     channel_context = &controller->channel_contexts[params.engine_index][params.channel_index];
-    if (!vctx_channel_is_logically_enabled(&context->vctx,
-        params.engine_index, params.channel_index)) {
+    if (!vctx_admission_snapshot_channel_enabled(&vctx_snapshot)) {
         VCTX_TRACE("TRANSFER_DENY requester=%llu gen=%llu engine=%u channel=%u status=%d stage=logical-channel\n",
             (unsigned long long)context->vctx.vctx_id,
             (unsigned long long)context->vctx.generation,
@@ -1495,7 +1572,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     transfer->vctx = &context->vctx;
     transfer->engine_index = params.engine_index;
     transfer->channel_index = params.channel_index;
-    transfer->generation = context->vctx.generation;
+    transfer->generation = vctx_snapshot.generation;
     transfer->starting_desc = params.starting_desc;
     transfer->sequence = atomic64_inc_return(&context->vctx.next_transfer_sequence);
     hailo_vdma_vctx_get(&context->vctx);
@@ -1524,10 +1601,12 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
     }
 
     spin_lock_irqsave(&channel_context->admission_lock, flags);
+    vctx_get_admission_snapshot(&context->vctx, params.engine_index,
+        params.channel_index, &vctx_snapshot);
     if (channel_context->shutting_down ||
-        !vctx_generation_is_active(&context->vctx, transfer->generation) ||
-        !vctx_channel_is_logically_enabled(&context->vctx,
-            params.engine_index, params.channel_index)) {
+        vctx_snapshot.state != HAILO_VDMA_VCTX_ACTIVE ||
+        vctx_snapshot.generation != transfer->generation ||
+        !vctx_snapshot.channel_enabled) {
         spin_unlock_irqrestore(&channel_context->admission_lock, flags);
         VCTX_TRACE("TRANSFER_CANCEL vctx=%llu gen=%llu seq=%llu engine=%u channel=%u status=%d stage=queue\n",
             (unsigned long long)transfer->vctx->vctx_id,
@@ -1573,16 +1652,14 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         }
 
         spin_lock_irqsave(&channel_context->admission_lock, flags);
-        if (transfer->cancel_requested ||
-            !vctx_generation_is_active(&context->vctx, transfer->generation) ||
-            !vctx_channel_is_logically_enabled(&context->vctx,
-                params.engine_index, params.channel_index) ||
-            vctx_fw_is_terminal(&context->vctx)) {
+        vctx_get_admission_snapshot(&context->vctx, params.engine_index,
+            params.channel_index, &vctx_snapshot);
+        if (transfer_admission_is_canceled(transfer, &vctx_snapshot)) {
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             cancel_waiting_transfer(transfer, channel_context);
             return -ECANCELED;
         }
-        if (!vctx_fw_is_runnable(&context->vctx) ||
+        if (!vctx_admission_snapshot_fw_runnable(&vctx_snapshot) ||
             READ_ONCE(channel_context->shutting_down)) {
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             continue;
@@ -1604,11 +1681,10 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
 
         mutex_lock(&channel_context->lock);
         spin_lock_irqsave(&channel_context->admission_lock, flags);
-        if (transfer->cancel_requested ||
-            !vctx_generation_is_active(&context->vctx, transfer->generation) ||
-            !vctx_channel_is_logically_enabled(&context->vctx,
-                params.engine_index, params.channel_index) ||
-            vctx_fw_is_terminal(&context->vctx) || channel_context->shutting_down) {
+        vctx_get_admission_snapshot(&context->vctx, params.engine_index,
+            params.channel_index, &vctx_snapshot);
+        if (transfer_admission_is_canceled(transfer, &vctx_snapshot) ||
+            channel_context->shutting_down) {
             if (!list_empty(&transfer->admission_node)) {
                 list_del_init(&transfer->admission_node);
             }
@@ -1626,23 +1702,25 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
             wake_up_all(&channel_context->admission_wq);
             return -ECANCELED;
         }
-        if (vctx_fw_is_runnable(&context->vctx) &&
-            vctx_device_dispatch_ready(&context->vctx, controller) &&
-            channel_admission_candidate_locked(transfer, channel_context) &&
-            ((channel_context->owner == &context->vctx && channel_context->enabled &&
-                channel_context->owner_generation == transfer->generation &&
-                channel_context->owner_dispatch_epoch ==
-                    atomic64_read(&controller->dispatch_epoch) &&
-                atomic_read(&channel_context->ongoing_count) < HAILO_VDMA_CHANNEL_TRANSFER_CAPACITY) ||
-             ((channel_context->owner != &context->vctx ||
-                channel_context->owner_dispatch_epoch !=
-                    atomic64_read(&controller->dispatch_epoch)) &&
-                atomic_read(&channel_context->ongoing_count) == 0 &&
-                (!channel_context->owner ||
-                 channel_context->owner == &context->vctx ||
-                 (vctx_generation_is_active(channel_context->owner,
-                    channel_context->owner_generation) &&
-                  vctx_fw_allows_owner_release(channel_context->owner))))) &&
+        admission_policy_ready =
+            vctx_admission_snapshot_fw_runnable(&vctx_snapshot) &&
+            vctx_device_dispatch_ready(&context->vctx, controller,
+                vctx_snapshot.resource_registered) &&
+            channel_admission_candidate_locked(transfer, channel_context,
+                vctx_snapshot.resource_registered);
+        physical_owner = channel_context->owner;
+        dispatch_epoch = atomic64_read(&controller->dispatch_epoch);
+        owner_releasable = true;
+        if (admission_policy_ready && physical_owner &&
+            physical_owner != &context->vctx) {
+            owner_releasable = vctx_generation_is_active(physical_owner,
+                channel_context->owner_generation) &&
+                vctx_fw_allows_owner_release(physical_owner);
+        }
+        if (admission_policy_ready &&
+            channel_has_admission_capacity(transfer, channel_context,
+                physical_owner, channel_context->owner_dispatch_epoch,
+                dispatch_epoch, owner_releasable) &&
             atomic_read(&context->vctx.transfer_count) < context->vctx.transfer_quota) {
             spin_unlock_irqrestore(&channel_context->admission_lock, flags);
             if (channel_context->owner != &context->vctx || !channel_context->enabled ||
