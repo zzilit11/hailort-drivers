@@ -453,10 +453,10 @@ void hailo_vdma_vctx_wake_all_admission(struct hailo_vdma_controller *controller
 }
 
 static enum hailo_vdma_admission_wake_scope merge_admission_wake_scope(
-    enum hailo_vdma_admission_wake_scope current,
+    enum hailo_vdma_admission_wake_scope existing_scope,
     enum hailo_vdma_admission_wake_scope added)
 {
-    return current > added ? current : added;
+    return existing_scope > added ? existing_scope : added;
 }
 
 static void apply_admission_wake_scope(struct hailo_vdma_controller *controller,
