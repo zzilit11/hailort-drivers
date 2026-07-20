@@ -158,6 +158,9 @@ struct hailo_vdma_vctx {
     bool activation_valid;
     u32 activation_request_len;
     CONTROL_PROTOCOL__request_t activation_request;
+    /* Controller-wide firmware-dispatch round-robin membership and demand. */
+    struct list_head dispatch_node;
+    atomic_t pending_transfer_count;
     struct list_head queued_transfers;
     struct list_head ongoing_transfers;
     struct list_head completed_transfers[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
@@ -207,6 +210,9 @@ struct hailo_vdma_controller {
     bool stall_monitor_stopped;
     struct hailo_vdma_channel_context channel_contexts[MAX_VDMA_ENGINES][MAX_VDMA_CHANNELS_PER_ENGINE];
     struct mutex dispatch_lock;
+    /* Protects dispatch_vctxs membership while the lockless request ID gates admission. */
+    spinlock_t dispatch_vctxs_lock;
+    struct list_head dispatch_vctxs;
     atomic_t total_ongoing_count;
     atomic64_t dispatched_vctx_id;
     atomic64_t dispatched_generation;

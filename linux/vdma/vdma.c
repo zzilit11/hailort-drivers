@@ -98,6 +98,8 @@ int hailo_vdma_controller_init(struct hailo_vdma_controller *controller,
     atomic_set(&controller->dispatch_commit_count, 0);
     atomic64_set(&controller->dispatch_request_vctx_id, 0);
     mutex_init(&controller->dispatch_lock);
+    spin_lock_init(&controller->dispatch_vctxs_lock);
+    INIT_LIST_HEAD(&controller->dispatch_vctxs);
     spin_lock_init(&controller->interrupts_lock);
     init_waitqueue_head(&controller->interrupts_wq);
     atomic64_set(&controller->last_vctx_id, 0);
@@ -156,6 +158,7 @@ void hailo_vdma_controller_reset(struct hailo_vdma_controller *controller)
 void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     struct hailo_vdma_controller *controller)
 {
+    unsigned long flags;
     u8 engine_index;
     u8 channel_index;
 
@@ -180,6 +183,8 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
     memset(&context->vctx.activation_request, 0, sizeof(context->vctx.activation_request));
     context->vctx.controller = controller;
     memset(context->vctx.events, 0, sizeof(context->vctx.events));
+    INIT_LIST_HEAD(&context->vctx.dispatch_node);
+    atomic_set(&context->vctx.pending_transfer_count, 0);
     INIT_LIST_HEAD(&context->vctx.queued_transfers);
     INIT_LIST_HEAD(&context->vctx.ongoing_transfers);
     for (engine_index = 0; engine_index < MAX_VDMA_ENGINES; engine_index++) {
@@ -192,6 +197,10 @@ void hailo_vdma_file_context_init(struct hailo_vdma_file_context *context,
             INIT_LIST_HEAD(&context->vctx.completed_transfers[engine_index][channel_index]);
         }
     }
+
+    spin_lock_irqsave(&controller->dispatch_vctxs_lock, flags);
+    list_add_tail(&context->vctx.dispatch_node, &controller->dispatch_vctxs);
+    spin_unlock_irqrestore(&controller->dispatch_vctxs_lock, flags);
 
     atomic_set(&context->last_vdma_user_buffer_handle, 0);
     INIT_LIST_HEAD(&context->mapped_user_buffer_list);

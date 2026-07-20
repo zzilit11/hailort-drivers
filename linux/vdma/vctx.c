@@ -292,11 +292,62 @@ static bool vctx_dispatch_cancel_request(struct hailo_vdma_vctx *vctx)
         vctx->vctx_id, 0) == vctx->vctx_id;
 }
 
+static u64 vctx_dispatch_request_next(struct hailo_vdma_controller *controller,
+    u64 current_vctx_id, bool *new_request)
+{
+    struct hailo_vdma_vctx *vctx;
+    unsigned long flags;
+    u64 requested_vctx_id;
+    u64 next_vctx_id = 0;
+    u64 wrapped_vctx_id = 0;
+
+    *new_request = false;
+    spin_lock_irqsave(&controller->dispatch_vctxs_lock, flags);
+    requested_vctx_id = atomic64_read(&controller->dispatch_request_vctx_id);
+    if (requested_vctx_id) {
+        goto exit;
+    }
+    list_for_each_entry(vctx, &controller->dispatch_vctxs, dispatch_node) {
+        u64 vctx_id = vctx->vctx_id;
+
+        if (vctx_id == current_vctx_id ||
+            atomic_read(&vctx->pending_transfer_count) <= 0 ||
+            !READ_ONCE(vctx->resource_registered) ||
+            READ_ONCE(vctx->state) != HAILO_VDMA_VCTX_ACTIVE ||
+            READ_ONCE(vctx->fw_state) != HAILO_VDMA_VCTX_FW_RUNNABLE) {
+            continue;
+        }
+        if (!wrapped_vctx_id || vctx_id < wrapped_vctx_id) {
+            wrapped_vctx_id = vctx_id;
+        }
+        if (vctx_id > current_vctx_id &&
+            (!next_vctx_id || vctx_id < next_vctx_id)) {
+            next_vctx_id = vctx_id;
+        }
+    }
+    next_vctx_id = next_vctx_id ? next_vctx_id : wrapped_vctx_id;
+    if (!next_vctx_id) {
+        requested_vctx_id = 0;
+        goto exit;
+    }
+    requested_vctx_id = atomic64_cmpxchg(
+        &controller->dispatch_request_vctx_id, 0, next_vctx_id);
+    if (!requested_vctx_id) {
+        requested_vctx_id = next_vctx_id;
+        *new_request = true;
+    }
+
+exit:
+    spin_unlock_irqrestore(&controller->dispatch_vctxs_lock, flags);
+    return requested_vctx_id;
+}
+
 static bool vctx_device_dispatch_ready(struct hailo_vdma_vctx *vctx,
     struct hailo_vdma_controller *controller, bool uses_fw_dispatch)
 {
     u64 dispatched_vctx_id;
     u64 requested_vctx_id;
+    bool new_request;
     bool time_expired;
     bool transfer_expired;
 
@@ -321,12 +372,14 @@ static bool vctx_device_dispatch_ready(struct hailo_vdma_vctx *vctx,
     }
 
     if (!requested_vctx_id) {
-        requested_vctx_id = atomic64_cmpxchg(
-            &controller->dispatch_request_vctx_id, 0, vctx->vctx_id);
+        requested_vctx_id = vctx_dispatch_request_next(controller,
+            dispatched_vctx_id, &new_request);
         if (!requested_vctx_id) {
-            requested_vctx_id = vctx->vctx_id;
+            return false;
+        }
+        if (new_request) {
             VCTX_TRACE("VCTX_QUANTUM_REQUEST requester=%llu owner=%llu commits=%d age_ms=%u time_expired=%u transfer_expired=%u device_ongoing=%d\n",
-                (unsigned long long)vctx->vctx_id,
+                (unsigned long long)requested_vctx_id,
                 (unsigned long long)dispatched_vctx_id,
                 atomic_read(&controller->dispatch_commit_count),
                 jiffies_to_msecs(jiffies -
@@ -1378,6 +1431,8 @@ static void transfer_dequeue_admission_locked(
 {
     if (!list_empty(&transfer->admission_node)) {
         list_del_init(&transfer->admission_node);
+        WARN_ON_ONCE(atomic_dec_return(
+            &transfer->vctx->pending_transfer_count) < 0);
     }
 }
 
@@ -1707,6 +1762,7 @@ long hailo_vdma_vctx_launch(struct hailo_vdma_file_context *context,
         return -ECANCELED;
     }
     list_add_tail(&transfer->admission_node, &channel_context->admission_queue);
+    atomic_inc(&context->vctx.pending_transfer_count);
     spin_unlock_irqrestore(&channel_context->admission_lock, flags);
     spin_lock_irqsave(&context->vctx.lock, flags);
     list_add_tail(&transfer->vctx_node, &context->vctx.queued_transfers);
@@ -2241,6 +2297,11 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     context->vctx.state = HAILO_VDMA_VCTX_CLOSING;
     context->vctx.generation++;
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    spin_lock_irqsave(&controller->dispatch_vctxs_lock, flags);
+    if (!list_empty(&context->vctx.dispatch_node)) {
+        list_del_init(&context->vctx.dispatch_node);
+    }
+    spin_unlock_irqrestore(&controller->dispatch_vctxs_lock, flags);
     (void)vctx_dispatch_cancel_request(&context->vctx);
     hailo_vdma_vctx_fw_state_changed(&context->vctx);
     VCTX_TRACE("VCTX_CLOSE_BEGIN vctx=%llu gen=%llu\n",
@@ -2263,6 +2324,7 @@ void hailo_vdma_vctx_finalize(struct hailo_vdma_file_context *context,
     WARN_ON_ONCE(!list_empty(&context->vctx.queued_transfers));
     WARN_ON_ONCE(!list_empty(&context->vctx.ongoing_transfers));
     spin_unlock_irqrestore(&context->vctx.lock, flags);
+    WARN_ON_ONCE(atomic_read(&context->vctx.pending_transfer_count) != 0);
     WARN_ON_ONCE(atomic_read(&context->vctx.transfer_count) != 0);
     hailo_vdma_vctx_put(&context->vctx);
     wait_for_completion(&context->vctx.refs_zero);
