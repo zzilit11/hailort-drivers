@@ -1,8 +1,10 @@
 #!/bin/sh
 
+set -eu
+
 module="hailo_pci"
 
-#unload driver
-sudo rmmod $module || exit 1
+# Unload the driver.
+sudo rmmod "$module"
 
-echo driver is unloaded
+echo "driver is unloaded"

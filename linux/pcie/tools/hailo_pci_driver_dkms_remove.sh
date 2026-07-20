@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 usage () {
     echo "Remove DKMS PCIe driver installation"
