@@ -18,8 +18,6 @@
 #include <linux/firmware.h>
 #include <linux/scatterlist.h>
 
-// Platform-specific includes are now handled in platform layers only
-
 #define HAILO_PCI_OVER_VDMA_MAX_CHANNELS (16) // Maximum number of channels available for boot
 #define HAILO_PCI_OVER_VDMA_PAGE_SIZE    (512)
 
@@ -118,7 +116,7 @@ struct hailo_pcie_loading_stage {
     u8 amount_of_files_in_stage;
 };
 
-// Common descriptor programming function - works directly with common structures
+// Descriptor programming parameters shared by the Linux PCIe code.
 struct hailo_pcie_boot_desc_programming_params {
     struct hailo_vdma_descriptors_list *device_desc_list;
     struct hailo_vdma_descriptors_list *host_desc_list;
@@ -126,19 +124,18 @@ struct hailo_pcie_boot_desc_programming_params {
     u32 max_desc_count;
 };
 
-// Common structure definitions for platform-agnostic firmware loading
+// Linux PCIe firmware-loading state.
 struct hailo_pcie_boot_dma_channel_state {
-    // The sg_table and kernel_address are considered common as linux-port provides
-    // compatible types for all platforms. The memory itself is allocated by the platform.
+    // The Linux PCIe layer allocates and owns this memory.
     struct sg_table sg_table;
     void *kernel_address;
 
     // Pointers to the descriptor lists within the buffers for convenience.
-    // The backing memory is allocated and managed by the platform-specific driver code.
+    // The backing memory is allocated and managed by the Linux PCIe driver.
     struct hailo_vdma_descriptors_list *host_descriptors_list;
     struct hailo_vdma_descriptors_list *device_descriptors_list;
 
-    // Common channel state
+    // Channel state
     u32 buffer_size;
     u32 desc_program_num;
 };
@@ -155,15 +152,6 @@ struct hailo_pcie_fw_boot {
     u16 boot_used_channel_bitmap;
 };
 
-// TODO: HRT-6144 - Align Windows/Linux to QNX
-#ifdef __QNX__
-enum hailo_bar_index {
-    BAR0 = 0,
-    BAR2,
-    BAR4,
-    MAX_BAR
-};
-#else
 enum hailo_bar_index {
     BAR0 = 0,
     BAR1,
@@ -173,7 +161,6 @@ enum hailo_bar_index {
     BAR5,
     MAX_BAR
 };
-#endif // ifdef (__QNX__)
 
 #ifdef __cplusplus
 extern "C" {

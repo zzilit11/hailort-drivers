@@ -4,10 +4,9 @@
 
 Note: The `master` branch supports only the Hailo-10 and Hailo-15 device families. For Hailo-8, Hailo-8R, and Hailo-8L devices, please use the `hailo8` branch.
 
-# Hailo PCIe driver #
+# Hailo Linux device drivers #
 
-The Hailo PCIe driver is necessary for interacting with a Hailo device over the PCIe interface. It connects the [**HailoRT library**](https://github.com/hailo-ai/hailort) to the device and loads the
-device's firmware when using this interface. The driver is responsible for managing the Hailo device, communicating with it, and transferring data to and from the device.
+This repository supports Linux exclusively. It contains the Hailo PCIe and integrated NNC kernel drivers used by the [**HailoRT library**](https://github.com/hailo-ai/hailort) to manage Hailo devices, load their firmware, and transfer data.
 
 ## Usage and Compilation
 

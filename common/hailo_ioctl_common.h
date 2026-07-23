@@ -6,6 +6,10 @@
 #ifndef _HAILO_IOCTL_COMMON_H_
 #define _HAILO_IOCTL_COMMON_H_
 
+#ifndef __linux__
+#error "HailoRT drivers support Linux only"
+#endif
+
 #define HAILO_DRV_VER_MAJOR 5
 #define HAILO_DRV_VER_MINOR 3
 #define HAILO_DRV_VER_REVISION 0
@@ -44,9 +48,8 @@
 #define HAILO_VDMA_MAX_ONGOING_TRANSFERS      (128)
 #define HAILO_VDMA_MAX_ONGOING_TRANSFERS_MASK (HAILO_VDMA_MAX_ONGOING_TRANSFERS - 1)
 
-#define INVALID_DRIVER_HANDLE_VALUE ((uintptr_t)-1)
-
-// Used by windows and unix driver to raise the right CPU control handle to the FW. The same as in pcie_service FW
+// Used by the Linux driver to raise the appropriate CPU control interrupt to the firmware.
+// The values match the pcie_service firmware definitions.
 enum hailo_pcie_nnc_interrupt_masks {
     FW_ACCESS_APP_CPU_CONTROL_MASK    =  (1 << 0),
     FW_ACCESS_CORE_CPU_CONTROL_MASK   =  (1 << 1),
@@ -62,80 +65,13 @@ enum hailo_pcie_soc_interrupt_masks {
 
 #define HAILO_DMA_DIRECTION_EQUALS(curr, other) (curr == HAILO_DMA_BIDIRECTIONAL || curr == other)
 
-#if !defined(__cplusplus) && defined(NTDDI_VERSION)
-#include <wdm.h>
-typedef ULONG uint32_t;
-typedef UCHAR uint8_t;
-typedef USHORT uint16_t;
-typedef ULONGLONG uint64_t;
-#endif /*  !defined(__cplusplus) && defined(NTDDI_VERSION) */
-
-
-#ifdef _MSC_VER
-
-#include <initguid.h>
-
-#if !defined(bool) && !defined(__cplusplus)
-typedef uint8_t bool;
-#endif // !defined(bool) && !defined(__cplusplus)
-
-#if !defined(INT_MAX)
-#define INT_MAX 0x7FFFFFFF
-#endif // !defined(INT_MAX)
-
-// {d88d31f1-fede-4e71-ac2a-6ce0018c1501}
-DEFINE_GUID (GUID_DEVINTERFACE_HailoKM_NNC,
-    0xd88d31f1,0xfede,0x4e71,0xac,0x2a,0x6c,0xe0,0x01,0x8c,0x15,0x01);
-
-// {7f16047d-64b8-207a-0092-e970893970a2}
-DEFINE_GUID (GUID_DEVINTERFACE_HailoKM_SOC,
-    0x7f16047d,0x64b8,0x207a,0x00,0x92,0xe9,0x70,0x89,0x39,0x70,0xa2);
-
-#define HAILO_GENERAL_IOCTL_MAGIC   0
-#define HAILO_VDMA_IOCTL_MAGIC      1
-#define HAILO_SOC_IOCTL_MAGIC       2
-#define HAILO_PCI_EP_IOCTL_MAGIC    3
-#define HAILO_NNC_IOCTL_MAGIC       4
-
-#define HAILO_IOCTL_COMPATIBLE                  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-
-typedef struct tCompatibleHailoIoctlParam
-{
-    union {
-        struct {
-            ULONG Size : 16;
-            ULONG Code : 8;
-            ULONG Type : 6;
-            ULONG Read : 1;
-            ULONG Write : 1;
-        } bits;
-        ULONG value;
-    } u;
-} tCompatibleHailoIoctlParam;
-
-static ULONG FORCEINLINE _IOC_(ULONG nr, ULONG type, ULONG size, bool read, bool write)
-{
-    struct tCompatibleHailoIoctlParam param;
-    param.u.bits.Code = nr;
-    param.u.bits.Size = size;
-    param.u.bits.Type = type;
-    param.u.bits.Read = read ? 1 : 0;
-    param.u.bits.Write = write ? 1 : 0;
-    return param.u.value;
-}
-
-#define _IOW_(type,nr,size) _IOC_(nr, type, sizeof(size), true, false)
-#define _IOR_(type,nr,size) _IOC_(nr, type, sizeof(size), false, true)
-#define _IOWR_(type,nr,size) _IOC_(nr, type, sizeof(size), true, true)
-#define _IO_(type,nr) _IOC_(nr, type, 0, false, false)
-
-#elif defined(__linux__) // #ifdef _MSC_VER
 #ifndef __KERNEL__
 // include the userspace headers only if this file is included by user space program
 // It is discourged to include them when compiling the driver (https://lwn.net/Articles/113349/)
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <sys/types.h>
 #else
 #include <linux/types.h>
 #include <linux/limits.h>
@@ -154,25 +90,6 @@ static ULONG FORCEINLINE _IOC_(ULONG nr, ULONG type, ULONG size, bool read, bool
 #define HAILO_SOC_IOCTL_MAGIC       's'
 #define HAILO_NNC_IOCTL_MAGIC       'n'
 #define HAILO_PCI_EP_IOCTL_MAGIC    'p'
-
-#elif defined(__QNX__) // #ifdef _MSC_VER
-#include <devctl.h>
-#include <stdint.h>
-#include <sys/types.h>
-#include <sys/mman.h>
-#include <stdbool.h>
-
-// defines for devctl
-#define _IOW_   __DIOF
-#define _IOR_   __DIOT
-#define _IOWR_  __DIOTF
-#define _IO_    __DION
-#define HAILO_GENERAL_IOCTL_MAGIC   _DCMD_ALL
-#define HAILO_VDMA_IOCTL_MAGIC      _DCMD_MISC
-
-#else // #ifdef _MSC_VER
-#error "unsupported platform!"
-#endif
 
 #pragma pack(push, 1)
 
@@ -384,9 +301,6 @@ struct hailo_device_properties {
     enum hailo_dma_type          dma_type;
     size_t                       dma_engines_count;
     bool                         is_fw_loaded;
-#ifdef __QNX__
-    pid_t                        resource_manager_pid;
-#endif // __QNX__
 };
 
 struct hailo_driver_info {
@@ -481,38 +395,6 @@ struct hailo_pci_ep_close_params {
     uint8_t input_channel_index;    // in
     uint8_t output_channel_index;   // in
 };
-
-#ifdef _MSC_VER
-struct tCompatibleHailoIoctlData
-{
-    tCompatibleHailoIoctlParam Parameters;
-    ULONG_PTR Value;
-    union {
-        struct hailo_vdma_enable_channels_params VdmaEnableChannels;
-        struct hailo_vdma_disable_channels_params VdmaDisableChannels;
-        struct hailo_vdma_interrupts_wait_params VdmaInterruptsWait;
-        struct hailo_vdma_buffer_sync_params VdmaBufferSync;
-        struct hailo_fw_control FirmwareControl;
-        struct hailo_vdma_buffer_params VdmaBufferParams;
-        struct hailo_desc_list_create_params DescListCreate;
-        struct hailo_desc_list_release_params DescListReleaseParam;
-        struct hailo_desc_list_program_params DescListProgram;
-        struct hailo_d2h_notification D2HNotification;
-        struct hailo_device_properties DeviceProperties;
-        struct hailo_driver_info DriverInfo;
-        struct hailo_read_log_params ReadLog;
-        struct hailo_mark_as_in_use_params MarkAsInUse;
-        struct hailo_vdma_launch_transfer_params LaunchTransfer;
-        struct hailo_vdma_prepare_transfer_params PrepareTransfer;
-        struct hailo_soc_connect_params ConnectParams;
-        struct hailo_soc_close_params SocCloseParams;
-        struct hailo_pci_ep_accept_params AcceptParams;
-        struct hailo_pci_ep_close_params PciEpCloseParams;
-        struct hailo_write_action_list_params WriteActionListParams;
-        struct hailo_vdma_cancel_prepared_transfer_params DescListResetParams;
-    } Buffer;
-};
-#endif // _MSC_VER
 
 #pragma pack(pop)
 

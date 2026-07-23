@@ -29,20 +29,10 @@ typedef struct {
     u32 code_size;
 } firmware_header_t;
 
-
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable:4200)
-#endif /* _MSC_VER */
-
 typedef struct {
     u32 key_size;
     u32 content_size;
 } secure_boot_certificate_header_t;
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif /* _MSC_VER */
 
 #define MINIMUM_FIRMWARE_CODE_SIZE (20*4)
 #define MAXIMUM_FIRMWARE_CERT_KEY_SIZE (0x1000)
